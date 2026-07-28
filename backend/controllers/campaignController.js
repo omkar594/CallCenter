@@ -1,6 +1,7 @@
 import { executeTenantQuery } from '../config/database.js';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { transcodeCampaignAudio } from '../services/audioTranscoder.js';
 
@@ -151,10 +152,17 @@ export async function createBroadcastCampaign(req, res) {
   }
 
   try {
-    // Prepare directory paths for transcoded voice prompts
-    const targetDir = path.resolve(process.cwd(), 'uploads', 'campaign_audio');
-    if (!fs.existsSync(targetDir)) {
-      fs.mkdirSync(targetDir, { recursive: true });
+    // Prepare directory paths for transcoded voice prompts (with OS tmpdir fallback for cloud containers)
+    let targetDir = path.resolve(process.cwd(), 'uploads', 'campaign_audio');
+    try {
+      if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
+      }
+    } catch (err) {
+      targetDir = path.join(os.tmpdir(), 'campaign_audio');
+      if (!fs.existsSync(targetDir)) {
+        fs.mkdirSync(targetDir, { recursive: true });
+      }
     }
 
     const outputFilename = `${Date.now()}_transcoded.wav`;
