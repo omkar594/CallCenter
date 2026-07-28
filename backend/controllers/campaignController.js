@@ -152,7 +152,7 @@ export async function createBroadcastCampaign(req, res) {
 
   try {
     // Prepare directory paths for transcoded voice prompts
-    const targetDir = '/home/cell24x7/Downloads/Project/ofc/CallCenter/backend/uploads/campaign_audio';
+    const targetDir = path.resolve(process.cwd(), 'uploads', 'campaign_audio');
     if (!fs.existsSync(targetDir)) {
       fs.mkdirSync(targetDir, { recursive: true });
     }
@@ -182,15 +182,27 @@ export async function createBroadcastCampaign(req, res) {
       }
     }
 
-    // Default tenant ID for standalone deployment
     const defaultTenantId = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
 
-    // Insert Campaign Master Record
-    const campaignResult = await executeTenantQuery(null, `
-      INSERT INTO voice_campaigns (tenant_id, name, audio_url, status, allowed_ports, total_leads)
-      VALUES ($1, $2, $3, 'running', $4, $5)
-      RETURNING *
-    `, [defaultTenantId, name, finalAudioUrl, parsedPorts, leads.length]);
+    // Insert Campaign Master Record with fallback if tenant_id column missing
+    let campaignResult;
+    try {
+      campaignResult = await executeTenantQuery(null, `
+        INSERT INTO voice_campaigns (tenant_id, name, audio_url, status, allowed_ports, total_leads)
+        VALUES ($1, $2, $3, 'running', $4, $5)
+        RETURNING *
+      `, [defaultTenantId, name, finalAudioUrl, parsedPorts, leads.length]);
+    } catch (err) {
+      if (err.message.includes('tenant_id')) {
+        campaignResult = await executeTenantQuery(null, `
+          INSERT INTO voice_campaigns (name, audio_url, status, allowed_ports, total_leads)
+          VALUES ($1, $2, 'running', $3, $4)
+          RETURNING *
+        `, [name, finalAudioUrl, parsedPorts, leads.length]);
+      } else {
+        throw err;
+      }
+    }
 
     const campaign = campaignResult.rows[0];
 
