@@ -20,6 +20,12 @@ function sendAMIAction(actionPayload) {
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: AMI_HOST, port: AMI_PORT });
     let responseData = '';
+    let loginSent = false;
+
+    socket.setTimeout(8000, () => {
+      socket.destroy();
+      reject(new Error(`AMI Connection Timeout connecting to ${AMI_HOST}:${AMI_PORT} (Check AWS EC2 Security Group Port 5038)`));
+    });
 
     socket.on('connect', () => {
       let loginMsg = `Action: Login\r\nUsername: ${AMI_USER}\r\nSecret: ${AMI_PASS}\r\n\r\n`;
@@ -29,7 +35,8 @@ function sendAMIAction(actionPayload) {
     socket.on('data', (chunk) => {
       responseData += chunk.toString();
 
-      if (responseData.includes('Response: Success') && responseData.includes('Authentication accepted')) {
+      if (!loginSent && responseData.includes('Response: Success') && responseData.includes('Authentication accepted')) {
+        loginSent = true;
         responseData = '';
 
         let actionMsg = '';
@@ -38,9 +45,10 @@ function sendAMIAction(actionPayload) {
         }
         actionMsg += '\r\n';
         socket.write(actionMsg);
+        return;
       }
 
-      if (responseData.includes('Response:')) {
+      if (loginSent && responseData.includes('Response:')) {
         socket.end();
         resolve(responseData);
       }
