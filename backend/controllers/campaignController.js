@@ -152,17 +152,14 @@ export async function createBroadcastCampaign(req, res) {
   }
 
   try {
-    // Prepare directory paths for transcoded voice prompts (with OS tmpdir fallback for cloud containers)
-    let targetDir = path.resolve(process.cwd(), 'uploads', 'campaign_audio');
+    // Prepare directory paths for transcoded voice prompts (using OS tmpdir guaranteed to be writable on cloud hosts like Render)
+    const targetDir = path.join(os.tmpdir(), 'campaign_audio');
     try {
       if (!fs.existsSync(targetDir)) {
         fs.mkdirSync(targetDir, { recursive: true });
       }
     } catch (err) {
-      targetDir = path.join(os.tmpdir(), 'campaign_audio');
-      if (!fs.existsSync(targetDir)) {
-        fs.mkdirSync(targetDir, { recursive: true });
-      }
+      console.warn('[CampaignController] Storage directory creation notice:', err.message);
     }
 
     const outputFilename = `${Date.now()}_transcoded.wav`;
