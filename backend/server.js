@@ -2,6 +2,8 @@ import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
 import dotenv from 'dotenv';
 
 // Import configs & services
@@ -33,9 +35,22 @@ const io = new Server(server, {
 // Expose Socket.io globally for real-time escalations
 global.io = io;
 
+// Ensure upload static directories exist on server boot
+const uploadsDir = path.resolve(process.cwd(), 'uploads');
+const tempUploadsDir = path.resolve(process.cwd(), 'uploads', 'temp');
+const audioUploadsDir = path.resolve(process.cwd(), 'uploads', 'campaign_audio');
+
+[uploadsDir, tempUploadsDir, audioUploadsDir].forEach(dir => {
+  if (!fs.existsSync(dir)) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (e) {}
+  }
+});
+
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
+app.use('/uploads', express.static(uploadsDir));
 
 // Mount API routes
 app.use('/api/auth', authRoutes);
