@@ -21,6 +21,9 @@ import campaignRoutes from './routes/campaign.js';
 import callRoutes from './routes/call.js';
 import analyticsRoutes from './routes/analytics.js';
 
+// Start Outbound Campaign Queue Worker
+import './bulkCampaignWorker.js';
+
 dotenv.config();
 
 const app = express();
