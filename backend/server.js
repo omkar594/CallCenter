@@ -59,6 +59,46 @@ app.use('/api/campaigns', campaignRoutes);
 app.use('/api/calls', callRoutes);
 app.use('/api/analytics', analyticsRoutes);
 
+// Auto-initialize database tables if missing (essential for cloud hosting like Render)
+async function initSchema() {
+  try {
+    await pool.query(`
+      CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+      CREATE TABLE IF NOT EXISTS voice_campaigns (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          name VARCHAR(255) NOT NULL,
+          allowed_ports VARCHAR(255) DEFAULT 'all',
+          audio_url VARCHAR(512),
+          status VARCHAR(50) DEFAULT 'pending',
+          total_leads INTEGER DEFAULT 0,
+          processed_leads INTEGER DEFAULT 0,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS campaign_leads (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          campaign_id UUID REFERENCES voice_campaigns(id) ON DELETE CASCADE,
+          customer_name VARCHAR(255),
+          phone_number VARCHAR(50) NOT NULL,
+          dial_status VARCHAR(50) DEFAULT 'pending',
+          call_duration INTEGER DEFAULT 0,
+          attempts INTEGER DEFAULT 0,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_leads_dial_status ON campaign_leads(dial_status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_leads_campaign_id ON campaign_leads(campaign_id);
+    `);
+    console.log('[Database] ✅ Schema and Indexes automatically verified/created.');
+  } catch (err) {
+    console.warn('[Database] Auto-schema init warning:', err.message);
+  }
+}
+initSchema();
+
 /**
  * Endpoint for Asterisk to verify inbound caller details and initiate ACD routing.
  * Triggers when Dinstar pushes calls to Asterisk.
