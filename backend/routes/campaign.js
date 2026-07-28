@@ -1,6 +1,15 @@
 import express from 'express';
 import multer from 'multer';
+import fs from 'fs';
 import { getCampaigns, getCampaignReport, createBroadcastCampaign } from '../controllers/campaignController.js';
+
+// Ensure upload directories exist on boot (essential for cloud containers like Render)
+if (!fs.existsSync('uploads/temp')) {
+  fs.mkdirSync('uploads/temp', { recursive: true });
+}
+if (!fs.existsSync('uploads/campaign_audio')) {
+  fs.mkdirSync('uploads/campaign_audio', { recursive: true });
+}
 
 const router = express.Router();
 const upload = multer({ dest: 'uploads/temp/' });
@@ -25,10 +34,10 @@ const optionalUpload = (req, res, next) => {
 // 1. Get all campaigns list
 router.get('/', getCampaigns);
 
-// 2. Get detailed campaign tracking report (connected vs failed calls & lead list)
-router.get('/:id', getCampaignReport);
-
-// 3. Initiate Bulk Outbound Campaign (Supports JSON payload OR Multipart Form-Data)
+// 2. Create new Outbound Voice Broadcast Campaign
 router.post('/broadcast', optionalUpload, createBroadcastCampaign);
+
+// 3. Get campaign detailed status & call progress
+router.get('/:id', getCampaignReport);
 
 export default router;
