@@ -1,26 +1,13 @@
 import express from 'express';
 import multer from 'multer';
+import os from 'os';
 import fs from 'fs';
 import path from 'path';
 import { getCampaigns, getCampaignReport, createBroadcastCampaign } from '../controllers/campaignController.js';
 
-// Absolute path resolution for uploads directory (essential for Linux cloud containers like Render)
-const tempDir = path.resolve(process.cwd(), 'uploads', 'temp');
-const audioDir = path.resolve(process.cwd(), 'uploads', 'campaign_audio');
-
-try {
-  if (!fs.existsSync(tempDir)) {
-    fs.mkdirSync(tempDir, { recursive: true });
-  }
-  if (!fs.existsSync(audioDir)) {
-    fs.mkdirSync(audioDir, { recursive: true });
-  }
-} catch (err) {
-  console.warn('[Storage] Directory creation warning:', err.message);
-}
-
+// Use OS temporary directory for upload stream buffer (guaranteed to exist on all cloud platforms like Render)
 const router = express.Router();
-const upload = multer({ dest: tempDir });
+const upload = multer({ dest: os.tmpdir() });
 
 // Conditional upload middleware: handles multipart/form-data uploads OR skips for application/json payloads
 const optionalUpload = (req, res, next) => {
