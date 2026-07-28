@@ -67,6 +67,7 @@ async function initSchema() {
 
       CREATE TABLE IF NOT EXISTS voice_campaigns (
           id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          tenant_id UUID DEFAULT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
           name VARCHAR(255) NOT NULL,
           allowed_ports VARCHAR(255) DEFAULT 'all',
           audio_url VARCHAR(512),
@@ -76,6 +77,8 @@ async function initSchema() {
           created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
+
+      ALTER TABLE voice_campaigns ADD COLUMN IF NOT EXISTS tenant_id UUID DEFAULT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
 
       CREATE TABLE IF NOT EXISTS campaign_leads (
           id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
