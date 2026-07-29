@@ -11,7 +11,7 @@ const AMI_HOST = process.env.ASTERISK_AMI_HOST || '127.0.0.1';
 const AMI_PORT = parseInt(process.env.ASTERISK_AMI_PORT) || 5038;
 const AMI_USER = process.env.ASTERISK_AMI_USER || 'ccmanager';
 const AMI_PASS = process.env.ASTERISK_AMI_PASS || 'ami_secret_change_me';
-const PACING_BUFFER_DELAY_SEC = parseInt(process.env.PACING_BUFFER_DELAY_SEC) || 3;
+const PACING_BUFFER_DELAY_SEC = parseInt(process.env.PACING_BUFFER_DELAY_SEC) || 15;
 
 /**
  * Sends a raw AMI Action to Asterisk
