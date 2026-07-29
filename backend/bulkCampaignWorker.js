@@ -197,4 +197,9 @@ async function startWorkerLoop() {
   }
 }
 
-startWorkerLoop();
+if (global.isWorkerRunning) {
+  console.log('[Worker] ⚠️ Duplicate worker start prevented. Single worker instance active.');
+} else {
+  global.isWorkerRunning = true;
+  startWorkerLoop();
+}
