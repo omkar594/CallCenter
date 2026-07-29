@@ -67,6 +67,14 @@ const campaignPortCounters = {};
 // ----------------- Atomic Single-Query Direct DB Queue Worker -----------------
 async function processNextPendingLead() {
   try {
+    // Strict Single Active Call Lock: Do not pick a new lead if any lead is currently in 'processing' status
+    const activeCheck = await pool.query(`
+      SELECT id FROM campaign_leads WHERE dial_status = 'processing' LIMIT 1
+    `);
+    if (activeCheck.rows.length > 0) {
+      return false; // Active call in progress, wait for channel release
+    }
+
     // Single Atomic SQL query: locks 1 lead in CTE and updates status = 'processing' safely
     const result = await pool.query(`
       WITH target_lead AS (
