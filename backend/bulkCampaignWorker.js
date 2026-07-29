@@ -67,6 +67,12 @@ const campaignPortCounters = {};
 // ----------------- Atomic Single-Query Direct DB Queue Worker -----------------
 async function processNextPendingLead() {
   try {
+    // Auto-recover stale leads stuck in 'processing' for > 60s
+    await pool.query(`
+      UPDATE campaign_leads SET dial_status = 'failed', updated_at = NOW()
+      WHERE dial_status = 'processing' AND updated_at < NOW() - INTERVAL '60 seconds'
+    `);
+
     // Strict Single Active Call Lock: Do not pick a new lead if any lead is currently in 'processing' status
     const activeCheck = await pool.query(`
       SELECT id FROM campaign_leads WHERE dial_status = 'processing' LIMIT 1
