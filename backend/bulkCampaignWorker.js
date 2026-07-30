@@ -268,7 +268,12 @@ async function startWorkerLoop() {
 // manually-launched `node bulkCampaignWorker.js`, or two Render instances) both dialing off
 // the same table at once. The lock is held for the process lifetime via a dedicated client
 // that is never released back to the pool; Postgres frees it automatically if the process dies.
-const WORKER_LOCK_KEY = 727511;
+// Bumped from 727511: an orphaned process from an earlier broken two-process deployment
+// (before the Start Command was fixed to run a single process) never released the old key,
+// permanently blocking every subsequent deploy's worker from ever acquiring it. A fresh key
+// means this deploy's worker doesn't contend with that zombie at all - the orphan can only
+// ever hold the old key, which nothing else needs anymore.
+const WORKER_LOCK_KEY = 727512;
 
 async function acquireSingletonLock() {
   const client = await pool.connect();
