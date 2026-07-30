@@ -263,7 +263,11 @@ export async function createBroadcastCampaign(req, res) {
     // Save all leads in a single multi-row INSERT (one round-trip, one transaction) instead
     // of one INSERT per lead - matters once CSVs run into the thousands of rows.
     const valuesSql = leads.map((_, i) => {
-      const base = i * 3;
+      // Each lead contributes exactly 2 params (phone, name) on top of the shared $1
+      // campaign_id - this was previously stride-3, which skipped a placeholder number
+      // for every lead after the first and left it unreferenced anywhere in the query
+      // text, hence Postgres's "could not determine data type of parameter" error.
+      const base = i * 2;
       return `($1, $${base + 2}, $${base + 3}, 'pending')`;
     }).join(', ');
     const insertParams = [campaign.id];
