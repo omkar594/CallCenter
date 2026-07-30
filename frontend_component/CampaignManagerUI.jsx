@@ -1,7 +1,25 @@
 import React, { useState, useEffect } from 'react';
 import { Upload, Play, Server, Layers, BarChart3, AlertCircle } from 'lucide-react';
 
-export default function CampaignManagerUI({ token }) {
+// Resolves the backend base URL from (in order): an explicit `apiBaseUrl` prop, a Vite
+// env var, a Create React App env var, then a localhost fallback for pure local dev.
+// This component ships without its own build tooling (see README) and used to hardcode
+// http://localhost:5000 in three places, which meant it could never reach a Render-hosted
+// backend once deployed anywhere else - pass `apiBaseUrl` explicitly when embedding this in
+// a host app if neither env var convention applies.
+function resolveApiBaseUrl(apiBaseUrlProp) {
+  if (apiBaseUrlProp) return apiBaseUrlProp;
+  if (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL) {
+    return import.meta.env.VITE_API_BASE_URL;
+  }
+  if (typeof process !== 'undefined' && process.env?.REACT_APP_API_BASE_URL) {
+    return process.env.REACT_APP_API_BASE_URL;
+  }
+  return 'http://localhost:5000';
+}
+
+export default function CampaignManagerUI({ token, apiBaseUrl }) {
+  const API_BASE_URL = resolveApiBaseUrl(apiBaseUrl);
   const [campaigns, setCampaigns] = useState([]);
   const [campaignName, setCampaignName] = useState('');
   const [csvFile, setCsvFile] = useState(null);
@@ -27,7 +45,7 @@ export default function CampaignManagerUI({ token }) {
 
   const fetchCampaigns = async () => {
     try {
-      const res = await fetch('http://localhost:5000/api/campaigns', {
+      const res = await fetch(`${API_BASE_URL}/api/campaigns`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await res.json();
@@ -39,7 +57,7 @@ export default function CampaignManagerUI({ token }) {
 
   const fetchGatewayTelemetry = async () => {
     try {
-      const res = await fetch('http://localhost:5000/api/gateways/allocations', {
+      const res = await fetch(`${API_BASE_URL}/api/gateways/allocations`, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await res.json();
@@ -66,7 +84,7 @@ export default function CampaignManagerUI({ token }) {
     }
 
     try {
-      const res = await fetch('http://localhost:5000/api/campaigns/broadcast', {
+      const res = await fetch(`${API_BASE_URL}/api/campaigns/broadcast`, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}` },
         body: formData

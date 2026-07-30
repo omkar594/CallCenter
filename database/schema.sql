@@ -198,29 +198,38 @@ CREATE POLICY buckets_isolation ON buckets FOR ALL USING (rls_tenant_check(tenan
 CREATE POLICY escalations_isolation ON escalations FOR ALL USING (rls_tenant_check(tenant_id));
 
 -- 12. Voice Campaigns
+-- NOTE: tenant_id is intentionally nullable with a default and NOT a foreign key, matching
+-- server.js's initSchema() - the outbound_campaign_module is deployed standalone (see README)
+-- without the full multi-tenant `tenants` table existing, so a hard FK here would break the
+-- deployed-on-Render path. Keep this table's definition identical to initSchema() in server.js.
 CREATE TABLE voice_campaigns (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    tenant_id UUID DEFAULT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
     name VARCHAR(255) NOT NULL,
-    audio_url VARCHAR(512) NOT NULL,
+    audio_url VARCHAR(512),
     status VARCHAR(50) DEFAULT 'pending',
     allowed_ports VARCHAR(255) DEFAULT 'all',
     total_leads INTEGER DEFAULT 0,
     processed_leads INTEGER DEFAULT 0,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 13. Campaign Leads
 CREATE TABLE campaign_leads (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    campaign_id UUID NOT NULL REFERENCES voice_campaigns(id) ON DELETE CASCADE,
+    campaign_id UUID REFERENCES voice_campaigns(id) ON DELETE CASCADE,
     phone_number VARCHAR(50) NOT NULL,
     customer_name VARCHAR(255),
     dial_status VARCHAR(50) DEFAULT 'pending',
     call_duration INTEGER DEFAULT 0,
     attempts INTEGER DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_leads_dial_status ON campaign_leads(dial_status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_leads_campaign_id ON campaign_leads(campaign_id);
 
 -- 14. Gateway Port Telemetry
 CREATE TABLE gateway_port_telemetry (

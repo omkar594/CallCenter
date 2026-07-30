@@ -4,15 +4,20 @@
   "description": "Multi-Tenant Cloud Contact Center Backend",
   "main": "server.js",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
   "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
     "axios": "^1.18.1",
     "bcryptjs": "^2.4.3",
     "bullmq": "^5.80.6",
     "cors": "^2.8.5",
+    "csv-parse": "^7.0.1",
     "dotenv": "^16.6.1",
     "express": "^4.19.2",
     "fluent-ffmpeg": "^2.1.3",
@@ -20,6 +25,7 @@
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.2.0",
     "pg": "^8.22.0",
-    "socket.io": "^4.7.5"
+    "socket.io": "^4.7.5",
+    "ssh2-sftp-client": "^12.1.1"
   }
 }

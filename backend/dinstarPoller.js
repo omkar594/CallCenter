@@ -1,25 +1,18 @@
 import axios from 'axios';
 import https from 'https';
 import pg from 'pg';
-import Redis from 'ioredis';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import redis from './config/redis.js';
 
 dotenv.config();
 
-// PostgreSQL and Redis connection setup
+// PostgreSQL connection setup. Redis goes through the shared config/redis.js proxy (which
+// falls back to a safe no-op mock when Redis is unreachable) instead of a second raw ioredis
+// client - the previous standalone client here had enableOfflineQueue:false and would throw
+// an UNHANDLED rejection (crashing the whole process) whenever a gateway poll failure tried
+// to reset the Redis concurrency key while Redis was also down.
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379', {
-  maxRetriesPerRequest: 1,
-  enableOfflineQueue: false,
-  retryStrategy(times) {
-    if (times > 1) return null;
-    return 100;
-  }
-});
-redis.on('error', (err) => {
-  // Suppress ECONNREFUSED terminal spam when Redis is not running
-});
 
 const DINSTAR_IP = process.env.DINSTAR_GATEWAY_IP || '192.168.1.186';
 const DINSTAR_USER = process.env.DINSTAR_API_USER || 'admin';
@@ -164,6 +157,13 @@ async function pollDinstarPorts() {
   }
 }
 
-// Execute polling interval every 15 seconds
-setInterval(pollDinstarPorts, 15000);
-pollDinstarPorts();
+// Execute polling interval every 15 seconds. Guarded the same way as bulkCampaignWorker.js
+// so an old standalone `node dinstarPoller.js` launch (see README history) can't double-poll
+// alongside the in-process import from server.js.
+if (global.isDinstarPollerRunning) {
+  console.log('[Poller] Duplicate poller start prevented (already running in this process).');
+} else {
+  global.isDinstarPollerRunning = true;
+  setInterval(pollDinstarPorts, 15000);
+  pollDinstarPorts();
+}

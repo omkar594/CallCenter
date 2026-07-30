@@ -106,8 +106,17 @@ export async function getLiveGatewayStatus(req, res) {
     }
 
     const gateway = gatewayResult.rows[0];
-    const service = new DinstarService(gateway.ip_address);
-    const livePorts = await service.getPortsInfo();
+    const service = new DinstarService(gateway.ip_address, process.env.DINSTAR_API_USER, process.env.DINSTAR_API_PASS);
+
+    let livePorts;
+    try {
+      livePorts = await service.getPortsInfo();
+    } catch (gatewayError) {
+      // Surface hardware unreachability as a real error (502) instead of silently
+      // returning fabricated port data - see plan Workstream 4.
+      console.error('Dinstar gateway unreachable:', gatewayError.message);
+      return res.status(502).json({ error: `Dinstar gateway unreachable: ${gatewayError.message}` });
+    }
 
     res.json({
       gatewayId: gateway.id,

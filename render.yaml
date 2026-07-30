@@ -1,0 +1,47 @@
+services:
+  - type: web
+    name: outbound-campaign-backend
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20.20.2
+      - key: PORT
+        value: 5000
+      - key: DATABASE_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ASTERISK_AMI_HOST
+        sync: false
+      - key: ASTERISK_AMI_PORT
+        value: 5038
+      - key: ASTERISK_AMI_USER
+        sync: false
+      - key: ASTERISK_AMI_PASS
+        sync: false
+      - key: AMI_MOCK_MODE
+        value: "false"
+      - key: DINSTAR_GATEWAY_IP
+        sync: false
+      - key: DINSTAR_API_USER
+        sync: false
+      - key: DINSTAR_API_PASS
+        sync: false
+      - key: PACING_BUFFER_DELAY_SEC
+        value: 2
+      - key: ASTERISK_SSH_HOST
+        sync: false
+      - key: ASTERISK_SSH_PORT
+        value: 22
+      - key: ASTERISK_SSH_USER
+        sync: false
+      - key: ASTERISK_SSH_PRIVATE_KEY_PATH
+        value: /etc/secrets/asterisk_deploy_key
+      - key: ASTERISK_SOUNDS_DIR
+        value: /campaign_audio

@@ -1,219 +1,296 @@
-import net from 'net';
 import pg from 'pg';
-import path from 'path';
 import dotenv from 'dotenv';
+import asteriskService from './services/asteriskService.js';
 
 dotenv.config();
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 
-const AMI_HOST = process.env.ASTERISK_AMI_HOST || '127.0.0.1';
-const AMI_PORT = parseInt(process.env.ASTERISK_AMI_PORT) || 5038;
-const AMI_USER = process.env.ASTERISK_AMI_USER || 'ccmanager';
-const AMI_PASS = process.env.ASTERISK_AMI_PASS || 'ami_secret_change_me';
-const rawDelay = parseInt(process.env.PACING_BUFFER_DELAY_SEC);
-const PACING_BUFFER_DELAY_SEC = (isNaN(rawDelay) || rawDelay < 12) ? 12 : rawDelay;
+// How long to ring before giving up on a lead (Originate's Timeout, ms).
+const ORIGINATE_RING_TIMEOUT_MS = parseInt(process.env.ORIGINATE_RING_TIMEOUT_MS) || 45000;
+// How long to wait for Asterisk's OriginateResponse event before assuming the dial died silently.
+const ORIGINATE_RESPONSE_TIMEOUT_MS = ORIGINATE_RING_TIMEOUT_MS + 20000;
+// Safety cap on how long an answered call may hold its slot before we free it even without
+// a Hangup event (covers a dropped/missed event - the SIM channel physically stays busy
+// through ringing + the voice prompt, so this must comfortably exceed both).
+const MAX_CALL_DURATION_MS = parseInt(process.env.MAX_CALL_DURATION_MS) || 5 * 60 * 1000;
+// DB-level backstop for leads still stuck 'processing' after a worker crash/restart lost
+// its in-memory event listeners entirely.
+const STALE_LEAD_TIMEOUT_SEC = parseInt(process.env.STALE_LEAD_TIMEOUT_SEC) || 400;
+// Small stagger between simultaneous dispatches within one tick, so a burst of free slots
+// doesn't fire a wall of simultaneous INVITEs at the gateway. This is NOT the call-pacing
+// mechanism anymore - real concurrency is gated by getMaxConcurrentCalls() below.
+const DISPATCH_STAGGER_MS = (() => {
+  const raw = parseInt(process.env.PACING_BUFFER_DELAY_SEC);
+  return (isNaN(raw) || raw < 0 ? 2 : raw) * 1000;
+})();
+const POLL_INTERVAL_MS = 2000;
+// Used only when gateway_port_telemetry has no live rows yet (e.g. dinstarPoller hasn't
+// polled since boot) - a conservative single-call-at-a-time fallback.
+const FALLBACK_MAX_CONCURRENT_CALLS = parseInt(process.env.MAX_CONCURRENT_CALLS) || 1;
 
-/**
- * Sends a raw AMI Action to Asterisk
- */
-function sendAMIAction(actionPayload) {
-  return new Promise((resolve, reject) => {
-    const socket = net.connect({ host: AMI_HOST, port: AMI_PORT });
-    let responseData = '';
-    let loginSent = false;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-    socket.setTimeout(8000, () => {
-      socket.destroy();
-      reject(new Error(`AMI Connection Timeout connecting to ${AMI_HOST}:${AMI_PORT} (Check AWS EC2 Security Group Port 5038)`));
-    });
-
-    socket.on('connect', () => {
-      let loginMsg = `Action: Login\r\nUsername: ${AMI_USER}\r\nSecret: ${AMI_PASS}\r\n\r\n`;
-      socket.write(loginMsg);
-    });
-
-    socket.on('data', (chunk) => {
-      responseData += chunk.toString();
-
-      if (!loginSent && responseData.includes('Response: Success') && responseData.includes('Authentication accepted')) {
-        loginSent = true;
-        responseData = '';
-
-        let actionMsg = '';
-        for (const [key, val] of Object.entries(actionPayload)) {
-          actionMsg += `${key}: ${val}\r\n`;
-        }
-        actionMsg += '\r\n';
-        socket.write(actionMsg);
-        return;
-      }
-
-      if (loginSent && responseData.includes('Response:')) {
-        socket.end();
-        resolve(responseData);
-      }
-    });
-
-    socket.on('error', (err) => {
-      reject(err);
-    });
-  });
-}
-
-// Track Round-Robin counters for campaigns with specific allowed ports
+// Track Round-Robin counters for campaigns with specific allowed ports. This remains an
+// informational hint only (logged + passed as a channel variable) - actual per-port SIM
+// pinning is a Dinstar-gateway-side routing decision, not something this codebase controls.
 const campaignPortCounters = {};
 
-// ----------------- Atomic Single-Query Direct DB Queue Worker -----------------
-async function processNextPendingLead() {
-  try {
-    // Auto-recover stale leads stuck in 'processing' for > 60s
-    await pool.query(`
-      UPDATE campaign_leads SET dial_status = 'failed', updated_at = NOW()
-      WHERE dial_status = 'processing' AND updated_at < NOW() - INTERVAL '60 seconds'
-    `);
+function pickPort(allowedPorts, campaignId) {
+  if (!allowedPorts || allowedPorts === 'all') {
+    return { targetPort: null, label: 'All Gateway Ports (Round-Robin)' };
+  }
+  const portList = String(allowedPorts).split(',').map(p => p.trim()).filter(Boolean);
+  if (portList.length === 0) {
+    return { targetPort: null, label: 'All Gateway Ports (Round-Robin)' };
+  }
+  if (campaignPortCounters[campaignId] === undefined) {
+    campaignPortCounters[campaignId] = 0;
+  }
+  const idx = campaignPortCounters[campaignId] % portList.length;
+  const targetPort = portList[idx];
+  campaignPortCounters[campaignId]++;
+  return { targetPort, label: `Selected Port ${targetPort} (out of restricted ports: [${portList.join(', ')}])` };
+}
 
-    // Strict Single Active Call Lock: Do not pick a new lead if any lead is currently in 'processing' status
-    const activeCheck = await pool.query(`
-      SELECT id FROM campaign_leads WHERE dial_status = 'processing' LIMIT 1
-    `);
-    if (activeCheck.rows.length > 0) {
-      return false; // Active call in progress, wait for channel release
-    }
+// India-only normalization, matching the SIMs this gateway currently carries. A genuine
+// 12-digit non-Indian number that happens to start with "91" will be mis-stripped - extend
+// this (or bring in a real phone-number library) before dialing outside India.
+function normalizePhoneNumber(rawNumber) {
+  const raw = String(rawNumber).trim();
+  let digits = raw.replace(/[^0-9]/g, '');
+  if (raw.startsWith('+91') && digits.length === 12) {
+    digits = digits.substring(2);
+  } else if (digits.startsWith('91') && digits.length === 12) {
+    digits = digits.substring(2);
+  } else if (digits.startsWith('0') && digits.length === 11) {
+    digits = digits.substring(1);
+  }
+  return digits;
+}
 
-    // Single Atomic SQL query: locks 1 lead in CTE and updates status = 'processing' safely
-    const result = await pool.query(`
-      WITH target_lead AS (
-        SELECT cl.id, cl.phone_number, cl.customer_name, cl.campaign_id, vc.audio_url, vc.allowed_ports
-        FROM campaign_leads cl
-        JOIN voice_campaigns vc ON cl.campaign_id = vc.id
-        WHERE cl.dial_status = 'pending' AND vc.status IN ('running', 'pending')
-        ORDER BY cl.updated_at ASC
-        LIMIT 1
-        FOR UPDATE OF cl SKIP LOCKED
-      )
-      UPDATE campaign_leads
-      SET dial_status = 'processing', attempts = campaign_leads.attempts + 1, updated_at = NOW()
-      FROM target_lead
-      WHERE campaign_leads.id = target_lead.id
-      RETURNING 
-        campaign_leads.id AS lead_id,
-        target_lead.phone_number,
-        target_lead.customer_name,
-        target_lead.campaign_id,
-        target_lead.audio_url,
-        target_lead.allowed_ports;
-    `);
-
-    if (result.rows.length === 0) {
-      return false; // No pending leads
-    }
-
-    const lead = result.rows[0];
-
-    // Format phone number for GSM Gateway (e.g. "+919324479120" -> "9324479120")
-    let cleanPhoneNumber = String(lead.phone_number).replace(/[^0-9]/g, '');
-    if (cleanPhoneNumber.startsWith('91') && cleanPhoneNumber.length === 12) {
-      cleanPhoneNumber = cleanPhoneNumber.substring(2);
-    }
-
-    // Determine specific Round-Robin port if allowedPorts is specified
-    const allowedPorts = lead.allowed_ports;
-    let targetPort = null;
-    let selectedPortText = 'All Gateway Ports (Round-Robin)';
-    if (allowedPorts && allowedPorts !== 'all') {
-      const portList = String(allowedPorts).split(',').map(p => p.trim()).filter(Boolean);
-      if (portList.length > 0) {
-        if (campaignPortCounters[lead.campaign_id] === undefined) {
-          campaignPortCounters[lead.campaign_id] = 0;
-        }
-        const portIdx = campaignPortCounters[lead.campaign_id] % portList.length;
-        targetPort = portList[portIdx];
-        campaignPortCounters[lead.campaign_id]++;
-        selectedPortText = `Selected Port ${targetPort} (out of restricted ports: [${portList.join(', ')}])`;
-      }
-    }
-
-    console.log(`\n======================================================`);
-    console.log(`[Worker] 📞 Dispatching Outbound Dial Job for Lead #${lead.lead_id}`);
-    console.log(`[Worker] Original Number: ${lead.phone_number}`);
-    console.log(`[Worker] Clean GSM Dial : ${cleanPhoneNumber}`);
-    console.log(`[Worker] Asterisk Host  : ${AMI_HOST}:${AMI_PORT}`);
-    console.log(`[Worker] Port Strategy  : 🔄 ${selectedPortText}`);
-    console.log(`======================================================\n`);
-
-    // Prepare Asterisk Channel string: Clean GSM numeric format for Dinstar Gateway
-    const channelName = `PJSIP/${cleanPhoneNumber}@DinstarTrunk`;
-
-    let audioPath = lead.audio_url || '';
-    const audioFilename = path.basename(audioPath);
-    if (audioPath.startsWith('/uploads/')) {
-      audioPath = `/home/cell24x7/Downloads/Project/ofc/CallCenter/backend${audioPath}`;
-    }
-    const cleanAudioPath = audioPath.replace(/\.[^/.]+$/, "");
-
-    try {
-      const response = await sendAMIAction({
-        Action: 'Originate',
-        Channel: channelName,
-        Context: 'campaign-broadcast-context',
-        Exten: cleanPhoneNumber,
-        Priority: 1,
-        CallerID: 'VoiceBroadcast',
-        Timeout: 60000, // 60 seconds full ringing duration
-        Async: 'true',
-        Variable: `CAMPAIGN_AUDIO_PATH=${cleanAudioPath},AUDIO_FILENAME=${audioFilename},LEAD_ID=${lead.lead_id},CAMP_ID=${lead.campaign_id},TARGET_PORT=${targetPort || ''}`
-      });
-
-      const singleLineResp = response.trim().replace(/\r?\n/g, ' | ');
-      console.log(`[Worker] AMI Response: ${singleLineResp}`);
-
-      if (response.includes('Response: Error')) {
-        console.error(`[Worker] ❌ Asterisk Rejected Originate Channel (${channelName})`);
-        await pool.query(`UPDATE campaign_leads SET dial_status = 'failed', updated_at = NOW() WHERE id = $1`, [lead.lead_id]);
-      } else {
-        console.log(`[Worker] ✅ Call Originate Successfully Dispatched!`);
-        await pool.query(`UPDATE campaign_leads SET dial_status = 'completed', updated_at = NOW() WHERE id = $1`, [lead.lead_id]);
-        await pool.query(`UPDATE voice_campaigns SET processed_leads = processed_leads + 1 WHERE id = $1`, [lead.campaign_id]);
-      }
-
-    } catch (err) {
-      console.error(`[Worker] ❌ Failed to dispatch call for lead ${lead.lead_id}:`, err.message);
-      await pool.query(`
-        UPDATE campaign_leads SET dial_status = 'failed', updated_at = NOW() WHERE id = $1
-      `, [lead.lead_id]);
-    }
-
-    // Apply Anti-Spam Carrier Pacing Delay Buffer
-    if (PACING_BUFFER_DELAY_SEC > 0) {
-      console.log(`[Worker] ⏳ Anti-Spam Pacing Buffer: Pausing ${PACING_BUFFER_DELAY_SEC}s to prevent SIM rate-limiting...`);
-      await new Promise(r => setTimeout(r, PACING_BUFFER_DELAY_SEC * 1000));
-    }
-
-    return true; // Lead processed, check for next lead immediately
-  } catch (error) {
-    console.error('[Worker] Error in DB Queue Loop:', error.message || error);
-    return false;
+// Best-effort mapping of AMI OriginateResponse "Reason" codes. Exact values vary slightly
+// across Asterisk versions, so unknown codes fall back to the generic 'failed' status rather
+// than guessing.
+function mapFailureReason(reason) {
+  switch (String(reason)) {
+    case '4': return 'busy';
+    case '1':
+    case '8': return 'no-answer';
+    default: return 'failed';
   }
 }
 
-// Continuous non-blocking Queue Loop
-async function startWorkerLoop() {
-  console.log('[Worker] 🚀 Single-Query Direct DB Worker started (Zero Redis mode).');
-  console.log(`[Worker] Connected to Asterisk AMI at ${AMI_HOST}:${AMI_PORT}`);
+async function reapStaleLeads() {
+  await pool.query(
+    `UPDATE campaign_leads SET dial_status = 'failed', updated_at = NOW()
+     WHERE dial_status = 'processing' AND updated_at < NOW() - ($1 || ' seconds')::interval`,
+    [STALE_LEAD_TIMEOUT_SEC]
+  );
+}
 
-  while (true) {
-    const processed = await processNextPendingLead();
-    if (!processed) {
-      // If no pending leads in DB, sleep 2 seconds before checking DB again
-      await new Promise(r => setTimeout(r, 2000));
+async function getActiveProcessingCount() {
+  const result = await pool.query(`SELECT COUNT(*)::int AS c FROM campaign_leads WHERE dial_status = 'processing'`);
+  return result.rows[0].c;
+}
+
+// Real concurrency capacity, driven by how many SIM ports are actually registered right now
+// (kept live by dinstarPoller.js). Falls back to a conservative default if telemetry is empty
+// (poller not running yet, or gateway unreachable) so we never over-dial an unknown gateway.
+async function getMaxConcurrentCalls() {
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*)::int AS registered FROM gateway_port_telemetry WHERE registration_status = 'REGISTER_OK'`
+    );
+    const registered = result.rows[0]?.registered || 0;
+    return registered > 0 ? registered : FALLBACK_MAX_CONCURRENT_CALLS;
+  } catch (err) {
+    return FALLBACK_MAX_CONCURRENT_CALLS;
+  }
+}
+
+async function claimNextPendingLead() {
+  const result = await pool.query(`
+    WITH target_lead AS (
+      SELECT cl.id, cl.phone_number, cl.customer_name, cl.campaign_id, vc.audio_url, vc.allowed_ports
+      FROM campaign_leads cl
+      JOIN voice_campaigns vc ON cl.campaign_id = vc.id
+      WHERE cl.dial_status = 'pending' AND vc.status IN ('running', 'pending')
+      ORDER BY cl.updated_at ASC
+      LIMIT 1
+      FOR UPDATE OF cl SKIP LOCKED
+    )
+    UPDATE campaign_leads
+    SET dial_status = 'processing', attempts = campaign_leads.attempts + 1, updated_at = NOW()
+    FROM target_lead
+    WHERE campaign_leads.id = target_lead.id
+    RETURNING
+      campaign_leads.id AS lead_id,
+      target_lead.phone_number,
+      target_lead.customer_name,
+      target_lead.campaign_id,
+      target_lead.audio_url,
+      target_lead.allowed_ports;
+  `);
+  return result.rows[0] || null;
+}
+
+async function finalizeLead(leadId, campaignId, dialStatus, durationSec) {
+  await pool.query(
+    `UPDATE campaign_leads SET dial_status = $1, call_duration = $2, updated_at = NOW() WHERE id = $3`,
+    [dialStatus, durationSec, leadId]
+  );
+  await pool.query(
+    `UPDATE voice_campaigns SET processed_leads = processed_leads + 1 WHERE id = $1`,
+    [campaignId]
+  );
+  console.log(`[Worker] Lead ${leadId} finalized: ${dialStatus} (${durationSec}s)`);
+}
+
+// Dispatches one lead and tracks it through to REAL completion via AMI events, instead of
+// marking it done the instant Asterisk acknowledges the Originate request. This is the fix
+// for the "2nd number never dials" bug: dial_status now stays 'processing' for the actual
+// duration of the call, so the concurrency gate in tick() genuinely reflects channel busy-ness.
+async function dispatchLead(lead) {
+  const cleanPhoneNumber = normalizePhoneNumber(lead.phone_number);
+  const { targetPort, label } = pickPort(lead.allowed_ports, lead.campaign_id);
+  const channelName = `PJSIP/${cleanPhoneNumber}@DinstarTrunk`;
+
+  console.log(`\n[Worker] Dispatching lead ${lead.lead_id} -> ${cleanPhoneNumber} | Port strategy: ${label}`);
+
+  const { actionId, ackPromise } = asteriskService.originateAsync(
+    channelName,
+    cleanPhoneNumber,
+    'campaign-broadcast-context',
+    1,
+    {
+      CAMPAIGN_AUDIO_FILE: lead.audio_url || '',
+      LEAD_ID: lead.lead_id,
+      CAMP_ID: lead.campaign_id,
+      TARGET_PORT: targetPort || ''
+    },
+    'VoiceBroadcast',
+    ORIGINATE_RING_TIMEOUT_MS
+  );
+
+  let ack;
+  try {
+    ack = await ackPromise;
+  } catch (err) {
+    console.error(`[Worker] AMI rejected dispatch for lead ${lead.lead_id}: ${err.message}`);
+    await finalizeLead(lead.lead_id, lead.campaign_id, 'failed', 0);
+    return;
+  }
+
+  if (ack.Response !== 'Success') {
+    console.error(`[Worker] Asterisk rejected Originate for lead ${lead.lead_id}: ${ack.Message}`);
+    await finalizeLead(lead.lead_id, lead.campaign_id, 'failed', 0);
+    return;
+  }
+
+  const dispatchedAt = Date.now();
+  const originateResponse = await asteriskService.waitForEvent(
+    'OriginateResponse',
+    (evt) => evt.ActionID === actionId,
+    ORIGINATE_RESPONSE_TIMEOUT_MS
+  );
+
+  if (!originateResponse) {
+    console.warn(`[Worker] Lead ${lead.lead_id}: no OriginateResponse within ${ORIGINATE_RESPONSE_TIMEOUT_MS}ms - treating as failed and freeing the slot`);
+    await finalizeLead(lead.lead_id, lead.campaign_id, 'failed', Math.round((Date.now() - dispatchedAt) / 1000));
+    return;
+  }
+
+  if (originateResponse.Response !== 'Success') {
+    const status = mapFailureReason(originateResponse.Reason);
+    console.log(`[Worker] Lead ${lead.lead_id}: call did not connect (${status}, reason=${originateResponse.Reason})`);
+    await finalizeLead(lead.lead_id, lead.campaign_id, status, Math.round((Date.now() - dispatchedAt) / 1000));
+    return;
+  }
+
+  // Call connected - the SIM channel stays genuinely busy through ringing + prompt playback,
+  // so keep this lead 'processing' (holding a concurrency slot) until the real Hangup.
+  const uniqueid = originateResponse.Uniqueid;
+  const hangupEvent = uniqueid
+    ? await asteriskService.waitForEvent('Hangup', (evt) => evt.Uniqueid === uniqueid, MAX_CALL_DURATION_MS)
+    : null;
+
+  if (!hangupEvent) {
+    console.warn(`[Worker] Lead ${lead.lead_id}: answered but no Hangup event within ${MAX_CALL_DURATION_MS}ms - freeing the slot anyway`);
+  }
+
+  const durationSec = Math.round((Date.now() - dispatchedAt) / 1000);
+  await finalizeLead(lead.lead_id, lead.campaign_id, 'answered', durationSec);
+}
+
+async function tick() {
+  if (!asteriskService.isConnected) {
+    return; // AMI connects during server startup; skip until it's up rather than burning leads
+  }
+
+  await reapStaleLeads();
+
+  const [activeCount, maxConcurrent] = await Promise.all([getActiveProcessingCount(), getMaxConcurrentCalls()]);
+  let freeSlots = maxConcurrent - activeCount;
+
+  while (freeSlots > 0) {
+    const lead = await claimNextPendingLead();
+    if (!lead) break;
+
+    // Fire-and-forget: dispatchLead tracks the call to completion asynchronously via AMI
+    // events and does not block this loop, so free slots can keep filling up.
+    dispatchLead(lead).catch((err) => {
+      console.error(`[Worker] Unhandled error dispatching lead ${lead.lead_id}:`, err.message || err);
+    });
+
+    freeSlots--;
+    if (freeSlots > 0 && DISPATCH_STAGGER_MS > 0) {
+      await sleep(DISPATCH_STAGGER_MS);
     }
   }
+}
+
+async function startWorkerLoop() {
+  console.log('[Worker] Event-driven campaign dialer started.');
+  console.log(`[Worker] Asterisk AMI target: ${process.env.ASTERISK_AMI_HOST || '(default)'}:${process.env.ASTERISK_AMI_PORT || 5038}`);
+
+  while (true) {
+    try {
+      await tick();
+    } catch (error) {
+      console.error('[Worker] Error in dialer tick:', error.message || error);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+// Postgres session-level advisory lock: guards against two backend processes (e.g. a stray
+// manually-launched `node bulkCampaignWorker.js`, or two Render instances) both dialing off
+// the same table at once. The lock is held for the process lifetime via a dedicated client
+// that is never released back to the pool; Postgres frees it automatically if the process dies.
+const WORKER_LOCK_KEY = 727511;
+
+async function acquireSingletonLock() {
+  const client = await pool.connect();
+  const result = await client.query('SELECT pg_try_advisory_lock($1) AS locked', [WORKER_LOCK_KEY]);
+  if (!result.rows[0].locked) {
+    client.release();
+    return null;
+  }
+  return client;
 }
 
 if (global.isWorkerRunning) {
-  console.log('[Worker] ⚠️ Duplicate worker start prevented. Single worker instance active.');
+  console.log('[Worker] Duplicate worker start prevented (already running in this process).');
 } else {
   global.isWorkerRunning = true;
-  startWorkerLoop();
+  (async () => {
+    const lockClient = await acquireSingletonLock();
+    if (!lockClient) {
+      console.warn('[Worker] Another process already holds the campaign dialer lock - not starting a second dialer.');
+      return;
+    }
+    console.log('[Worker] Acquired singleton dialer lock.');
+    startWorkerLoop();
+  })();
 }

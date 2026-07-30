@@ -23,6 +23,9 @@ import analyticsRoutes from './routes/analytics.js';
 
 // Start Outbound Campaign Queue Worker
 import './bulkCampaignWorker.js';
+// Start Dinstar gateway telemetry poller (previously never imported, so gateway_port_telemetry
+// never populated in the deployed process - see plan Workstream 4).
+import './dinstarPoller.js';
 
 dotenv.config();
 
@@ -62,7 +65,11 @@ app.use('/api/campaigns', campaignRoutes);
 app.use('/api/calls', callRoutes);
 app.use('/api/analytics', analyticsRoutes);
 
-// Auto-initialize database tables if missing (essential for cloud hosting like Render)
+// Auto-initialize database tables if missing (essential for cloud hosting like Render).
+// Kept in sync with database/schema.sql's voice_campaigns/campaign_leads definitions -
+// these two used to drift (different nullability, missing indexes/columns on one side),
+// which caused query failures depending on which path had created the tables. If you change
+// one, change the other.
 async function initSchema() {
   try {
     await pool.query(`
@@ -167,37 +174,29 @@ app.post('/api/voice/incoming-filter', async (req, res) => {
   }
 });
 
-// Webhook for Asterisk dialplan to report voice campaign call status updates
-app.get('/api/campaigns/callback', async (req, res) => {
-  const { leadId, status, duration } = req.query;
-  
-  if (!leadId || !status) {
-    return res.status(400).send('Missing leadId or status');
-  }
-
-  try {
-    await pool.query(`
-      UPDATE campaign_leads 
-      SET dial_status = $1, call_duration = $2, updated_at = NOW() 
-      WHERE id = $3
-    `, [status, parseInt(duration) || 0, leadId]);
-    
-    console.log(`[Campaign Callback] Lead ID: ${leadId} status updated to: ${status}`);
-    res.send('OK');
-  } catch (error) {
-    console.error('[Campaign Callback] Database update failed:', error.message);
-    res.status(500).send(error.message);
-  }
-});
+// NOTE: the /api/campaigns/callback webhook now lives in routes/campaign.js, mounted
+// BEFORE the '/:id' route - it used to be registered here, after '/api/campaigns' was
+// already mounted, so Express matched it as GET /api/campaigns/:id with id='callback'
+// and it was silently unreachable. See routes/campaign.js and campaignController.js.
 
 // App health check
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  // Previously `pool ? 'connected' : ...` and `redis ? 'connected' : ...` only checked that the
+  // client objects existed (always true), not that the connections actually work - so this
+  // endpoint could report "connected" while Postgres/Redis were both unreachable.
+  const [postgresOk, redisOk] = await Promise.all([
+    pool.query('SELECT 1').then(() => true).catch(() => false),
+    // redis is a Proxy that falls back to a mock lacking .ping() when disconnected, which
+    // returns null (not a promise) rather than rejecting - Promise.resolve() normalizes that.
+    Promise.resolve(redis.ping ? redis.ping() : null).then((r) => r === 'PONG').catch(() => false)
+  ]);
+
   res.json({
     status: 'healthy',
     timestamp: new Date(),
     connections: {
-      postgres: pool ? 'connected' : 'disconnected',
-      redis: redis ? 'connected' : 'disconnected',
+      postgres: postgresOk ? 'connected' : 'disconnected',
+      redis: redisOk ? 'connected' : 'disconnected',
       asterisk_ami: asteriskService.isConnected ? 'connected' : 'disconnected'
     }
   });

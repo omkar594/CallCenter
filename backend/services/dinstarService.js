@@ -91,93 +91,54 @@ class DinstarService {
    * @returns {Promise<Array>} port info status array
    */
   async getPortsInfo(ports = []) {
-    try {
-      const portParam = ports.length > 0 ? ports.join(',') : '0,1,2,3,4,5,6,7';
-      const infoTypes = 'imei,imsi,iccid,number,reg,slot,callstate,signal,gprs';
-      
-      const response = await this._request('/get_port_info', 'GET', {
-        port: portParam,
-        info_type: infoTypes
-      });
+    const portParam = ports.length > 0 ? ports.join(',') : '0,1,2,3,4,5,6,7';
+    const infoTypes = 'imei,imsi,iccid,number,reg,slot,callstate,signal,gprs';
 
-      if (response.data && response.data.error_code === 200) {
-        return response.data.info;
-      }
-      throw new Error(`Dinstar error code: ${response.data ? response.data.error_code : 'Unknown'}`);
-    } catch (error) {
-      console.error(`Dinstar API getPortsInfo failed for IP ${this.gatewayIp}:`, error.message);
-      return this._generateMockPorts(ports);
+    const response = await this._request('/get_port_info', 'GET', {
+      port: portParam,
+      info_type: infoTypes
+    });
+
+    if (response.data && response.data.error_code === 200) {
+      return response.data.info;
     }
+    // Deliberately not falling back to mock data here: a dead/unreachable gateway must be
+    // visible as an error to callers (/health, telemetry dashboards), not disguised as a
+    // healthy fake response. See plan Workstream 4.
+    throw new Error(`Dinstar error code: ${response.data ? response.data.error_code : 'Unknown'}`);
   }
 
   /**
    * Get device health/performance status.
    */
   async getDeviceStatus() {
-    try {
-      const response = await this._request('/get_status', 'POST', ['performance']);
-      if (response.data && response.data.performance) {
-        return response.data.performance;
-      }
-      throw new Error('Invalid performance status format');
-    } catch (error) {
-      console.error(`Dinstar API getDeviceStatus failed:`, error.message);
-      return {
-        cpu_used: '32',
-        flash_total: '27648',
-        flash_used: '17428',
-        memory_total: '109448',
-        memory_free: '60000',
-        memory_used: '49448'
-      };
+    const response = await this._request('/get_status', 'POST', ['performance']);
+    if (response.data && response.data.performance) {
+      return response.data.performance;
     }
+    throw new Error('Invalid performance status format');
   }
 
   /**
    * Send SMS via a specific port.
    */
   async sendSms(text, phoneNumber, port = 0) {
-    try {
-      const payload = {
-        text: text,
-        param: [
-          {
-            number: phoneNumber,
-            port: port,
-            user_id: Math.floor(Math.random() * 10000)
-          }
-        ]
-      };
-      
-      const response = await this._request('/send_sms', 'POST', payload);
-      if (response.data && response.data.error_code === 200) {
-        return { success: true, ref_id: response.data.ref_id || 101 };
-      }
-      throw new Error(`Dinstar SMS send failed: ${JSON.stringify(response.data)}`);
-    } catch (error) {
-      console.error(`Dinstar API sendSms failed:`, error.message);
-      return { success: true, ref_id: Math.floor(Math.random() * 100) + 1, isMock: true };
-    }
-  }
+    const payload = {
+      text: text,
+      param: [
+        {
+          number: phoneNumber,
+          port: port,
+          user_id: Math.floor(Math.random() * 10000)
+        }
+      ]
+    };
 
-  /**
-   * Generates mock port statuses for development fallback.
-   */
-  _generateMockPorts(ports) {
-    const list = ports.length > 0 ? ports : [0,1,2,3,4,5,6,7];
-    return list.map(p => ({
-      port: p,
-      type: 'LTE',
-      imei: `86307001700517${p}`,
-      imsi: `46000464214806${p}`,
-      iccid: `898600MFSSYYGGBB${p}`,
-      number: `+91998877660${p}`,
-      reg: 'REGISTER_OK',
-      slot: 0,
-      callstate: Math.random() > 0.85 ? 'Active' : 'Idle',
-      signal: 28,
-      gprs: 'attached'
-    }));
+    const response = await this._request('/send_sms', 'POST', payload);
+    if (response.data && response.data.error_code === 200) {
+      return { success: true, ref_id: response.data.ref_id || 101 };
+    }
+    throw new Error(`Dinstar SMS send failed: ${JSON.stringify(response.data)}`);
   }
 }
 

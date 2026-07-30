@@ -20,16 +20,25 @@ class AsteriskService extends EventEmitter {
     this.buffer = '';
     this.actionCallbacks = new Map();
     this.actionIdCounter = 1;
-    this.useMock = false;
+    // Mock mode must be an explicit opt-in for local dev without a real Asterisk box.
+    // It used to auto-enable on ANY connection/auth failure, which silently hid real
+    // outages behind fake "Success" responses in production - see plan Workstream 2.
+    this.useMock = process.env.AMI_MOCK_MODE === 'true';
   }
 
   /**
    * Connect to Asterisk AMI server
    */
   async connect() {
+    if (this.useMock) {
+      console.warn('[AsteriskService] AMI_MOCK_MODE=true - using the AMI simulator, not a real Asterisk connection.');
+      this.isConnected = true;
+      return true;
+    }
+
     return new Promise((resolve) => {
       console.log(`Attempting connection to Asterisk AMI at ${this.host}:${this.port}...`);
-      
+
       this.socket = net.connect({ host: this.host, port: this.port });
       this.socket.setKeepAlive(true);
 
@@ -46,15 +55,13 @@ class AsteriskService extends EventEmitter {
             resolve(true);
           } else {
             console.error('Asterisk AMI Authentication failed:', response.Message);
-            this.useMock = true;
-            this.isConnected = true;
-            resolve(true);
+            this.isConnected = false;
+            resolve(false);
           }
         } catch (err) {
           console.error('Asterisk AMI login command failed:', err.message);
-          this.useMock = true;
-          this.isConnected = true;
-          resolve(true);
+          this.isConnected = false;
+          resolve(false);
         }
       });
 
@@ -64,18 +71,15 @@ class AsteriskService extends EventEmitter {
       });
 
       this.socket.on('error', (err) => {
-        console.warn(`Asterisk AMI connection failed: ${err.message}. Enabling AMI Simulator.`);
-        this.useMock = true;
-        this.isConnected = true; // Mark true to allow simulator interactions
-        resolve(true);
+        console.error(`Asterisk AMI connection failed: ${err.message}.`);
+        this.isConnected = false;
+        resolve(false);
       });
 
       this.socket.on('close', () => {
-        if (!this.useMock) {
-          console.warn('Asterisk AMI socket connection closed. Reconnecting in 5s...');
-          this.isConnected = false;
-          setTimeout(() => this.connect(), 5000);
-        }
+        console.warn('Asterisk AMI socket connection closed. Reconnecting in 5s...');
+        this.isConnected = false;
+        setTimeout(() => this.connect(), 5000);
       });
     });
   }
@@ -135,6 +139,76 @@ class AsteriskService extends EventEmitter {
   }
 
   /**
+   * Originates an outbound call and returns immediately with the ActionID plus a promise
+   * for the immediate AMI ack (accepted/rejected). Callers that need the REAL call outcome
+   * (answered/busy/no-answer, and when the channel actually frees up) must separately listen
+   * for the 'OriginateResponse' event (matched by ActionID) and then the 'Hangup' event
+   * (matched by the Uniqueid carried on that OriginateResponse) - the ack alone only means
+   * "Asterisk accepted the request", not "the call happened". See bulkCampaignWorker.js.
+   */
+  originateAsync(channel, exten, context, priority, variables = {}, callerId = 'ContactCenter', timeoutMs = 45000) {
+    const actionId = `act_${this.actionIdCounter++}`;
+    const variablesStr = Object.entries(variables)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(',');
+    const payload = {
+      Action: 'Originate',
+      ActionID: actionId,
+      Channel: channel,
+      Exten: exten,
+      Context: context,
+      Priority: priority,
+      CallerID: callerId,
+      Variable: variablesStr,
+      Timeout: timeoutMs,
+      Async: 'true'
+    };
+
+    let ackPromise;
+    if (this.useMock) {
+      ackPromise = this._simulateAction('Originate', payload);
+    } else {
+      ackPromise = new Promise((resolve, reject) => {
+        if (!this.isConnected) {
+          return reject(new Error('Asterisk AMI not connected'));
+        }
+        this.actionCallbacks.set(actionId, { resolve, reject });
+        let rawString = '';
+        for (const [key, value] of Object.entries(payload)) {
+          rawString += `${key}: ${value}\r\n`;
+        }
+        rawString += '\r\n';
+        this.socket.write(rawString);
+      });
+    }
+
+    return { actionId, ackPromise };
+  }
+
+  /**
+   * Resolves once an event matching `predicate` fires on `eventName`, or null after `timeoutMs`.
+   * Used to correlate OriginateResponse/Hangup events back to a specific dispatched call.
+   */
+  waitForEvent(eventName, predicate, timeoutMs) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.removeListener(eventName, handler);
+        resolve(null);
+      }, timeoutMs);
+
+      const handler = (evt) => {
+        if (predicate(evt)) {
+          clearTimeout(timer);
+          this.removeListener(eventName, handler);
+          resolve(evt);
+        }
+      };
+
+      this.on(eventName, handler);
+    });
+  }
+
+  /**
    * Hang up a live channel
    */
   async hangupChannel(channel) {
@@ -187,52 +261,84 @@ class AsteriskService extends EventEmitter {
    */
   _simulateAction(action, payload) {
     console.log(`[AMI Simulator] Received Action: ${action}`, payload);
-    
+
     // Simulate events async to verify backend flow
     if (action === 'Originate') {
+      const uniqueid = `sim-${payload.ActionID}`;
+      const isAbsent = payload.Channel.includes('absent');
+
+      const emit = (evt) => {
+        this.emit('ami_event', evt);
+        this.emit(evt.Event, evt);
+      };
+
       setTimeout(() => {
         // Trigger ringing state
-        this.emit('ami_event', {
+        emit({
           Event: 'Newstate',
           Channel: payload.Channel,
+          Uniqueid: uniqueid,
           ChannelState: '4', // Ringing
           ChannelStateDesc: 'Ringing',
           CallerIDNum: payload.CallerID,
           Exten: payload.Exten
         });
 
-        // Simulate agent pickup or missed
+        // Simulate answer or no-answer, then a real OriginateResponse (the actual completion signal)
         setTimeout(() => {
-          if (payload.Channel.includes('absent')) {
-            // Trigger failed call event
-            this.emit('ami_event', {
+          if (isAbsent) {
+            emit({
+              Event: 'OriginateResponse',
+              ActionID: payload.ActionID,
+              Response: 'Failure',
+              Reason: '1', // no-answer
+              Uniqueid: uniqueid,
+              Channel: payload.Channel
+            });
+            emit({
               Event: 'Hangup',
               Channel: payload.Channel,
-              Cause: '16', // Normal clearing but unanswered in simulation terms
-              ChannelStateDesc: 'Ringing'
+              Uniqueid: uniqueid,
+              Cause: '19' // No answer
             });
           } else {
-            // Trigger answered/bridge event
-            this.emit('ami_event', {
+            emit({
               Event: 'Newstate',
               Channel: payload.Channel,
+              Uniqueid: uniqueid,
               ChannelState: '6', // Up/Active
               ChannelStateDesc: 'Up',
               CallerIDNum: payload.CallerID,
               Exten: payload.Exten
             });
-            
-            this.emit('ami_event', {
+            emit({
               Event: 'BridgeEnter',
               Channel1: payload.Channel,
               Channel2: `SIP/${payload.Exten}-peer`,
               CallerIDNum: payload.CallerID
             });
+            emit({
+              Event: 'OriginateResponse',
+              ActionID: payload.ActionID,
+              Response: 'Success',
+              Reason: '2', // Answered
+              Uniqueid: uniqueid,
+              Channel: payload.Channel
+            });
+            // Simulated prompt playback keeps the "channel" busy a bit longer before hangup.
+            setTimeout(() => {
+              emit({
+                Event: 'Hangup',
+                Channel: payload.Channel,
+                Uniqueid: uniqueid,
+                Cause: '16' // Normal clearing
+              });
+            }, 3000);
           }
         }, 2000);
       }, 500);
     }
-    
+
     return Promise.resolve({
       Response: 'Success',
       ActionID: payload.ActionID,
