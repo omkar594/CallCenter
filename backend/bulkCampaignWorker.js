@@ -28,6 +28,15 @@ const POLL_INTERVAL_MS = 2000;
 // Used only when gateway_port_telemetry has no live rows yet (e.g. dinstarPoller hasn't
 // polled since boot) - a conservative single-call-at-a-time fallback.
 const FALLBACK_MAX_CONCURRENT_CALLS = parseInt(process.env.MAX_CONCURRENT_CALLS) || 1;
+// How many times a lead may be retried after an immediate gateway-level rejection (e.g. SIP
+// 480/503 - "no line free right now") before it's given up on as a genuine failure.
+const MAX_DIAL_ATTEMPTS = parseInt(process.env.MAX_DIAL_ATTEMPTS) || 3;
+// How stale gateway_port_telemetry is allowed to be before we stop trusting it. dinstarPoller
+// polls roughly every 15s; if it hasn't successfully written a row in 90s (gateway unreachable,
+// poll timing out), treat capacity as unknown rather than dialing off a last-known-good count
+// that may no longer be true - a stale "2 ports registered" reading is what let two calls fire
+// at once against a gateway that in practice only had 1 line free, producing SIP 480/503s.
+const TELEMETRY_FRESHNESS_SEC = parseInt(process.env.TELEMETRY_FRESHNESS_SEC) || 90;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -100,7 +109,9 @@ async function getActiveProcessingCount() {
 async function getMaxConcurrentCalls() {
   try {
     const result = await pool.query(
-      `SELECT COUNT(*)::int AS registered FROM gateway_port_telemetry WHERE registration_status = 'REGISTER_OK'`
+      `SELECT COUNT(*)::int AS registered FROM gateway_port_telemetry
+       WHERE registration_status = 'REGISTER_OK' AND last_polled > NOW() - ($1 || ' seconds')::interval`,
+      [TELEMETRY_FRESHNESS_SEC]
     );
     const registered = result.rows[0]?.registered || 0;
     return registered > 0 ? registered : FALLBACK_MAX_CONCURRENT_CALLS;
@@ -132,6 +143,7 @@ async function claimNextPendingLead() {
     WHERE campaign_leads.id = target_lead.id
     RETURNING
       campaign_leads.id AS lead_id,
+      campaign_leads.attempts,
       target_lead.phone_number,
       target_lead.customer_name,
       target_lead.campaign_id,
@@ -139,6 +151,17 @@ async function claimNextPendingLead() {
       target_lead.allowed_ports;
   `);
   return result.rows[0] || null;
+}
+
+// Puts a lead back in the queue instead of finalizing it as a permanent failure. Used only
+// for immediate gateway-level rejections (no line free right now), so other pending leads -
+// in this campaign or others - get a turn before this one is retried, rather than it either
+// blocking everything behind it or being burned as failed on a purely capacity-driven reject.
+async function requeueLead(leadId) {
+  await pool.query(
+    `UPDATE campaign_leads SET dial_status = 'pending', updated_at = NOW() WHERE id = $1`,
+    [leadId]
+  );
 }
 
 async function finalizeLead(leadId, campaignId, dialStatus, durationSec) {
@@ -209,6 +232,16 @@ async function dispatchLead(lead) {
 
   if (originateResponse.Response !== 'Success') {
     const status = mapFailureReason(originateResponse.Reason);
+    // Reason 0 on an essentially-instant rejection is how this gateway reports "no line free
+    // right now" (SIP 480/503 back from Dinstar before the call ever really rang) rather than
+    // a real busy-tone/no-answer outcome for the callee. Requeue it - bounded by attempts -
+    // instead of burning the lead as permanently failed just because two leads happened to
+    // race for the gateway's one actually-available line.
+    if (status === 'failed' && String(originateResponse.Reason) === '0' && lead.attempts < MAX_DIAL_ATTEMPTS) {
+      console.log(`[Worker] Lead ${lead.lead_id}: gateway had no free line (reason=0) - requeueing (attempt ${lead.attempts}/${MAX_DIAL_ATTEMPTS})`);
+      await requeueLead(lead.lead_id);
+      return;
+    }
     console.log(`[Worker] Lead ${lead.lead_id}: call did not connect (${status}, reason=${originateResponse.Reason})`);
     await finalizeLead(lead.lead_id, lead.campaign_id, status, Math.round((Date.now() - dispatchedAt) / 1000));
     return;
