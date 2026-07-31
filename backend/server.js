@@ -104,6 +104,50 @@ async function initSchema() {
 
       CREATE INDEX IF NOT EXISTS idx_leads_dial_status ON campaign_leads(dial_status, updated_at);
       CREATE INDEX IF NOT EXISTS idx_leads_campaign_id ON campaign_leads(campaign_id);
+
+      -- Gateway Telemetry API tables (GET /api/gateways etc.) - these were defined in
+      -- database/schema.sql but that file was never actually run against production, only
+      -- this function was, so these tables never existed and every gateway-management
+      -- endpoint 500'd. Created here the same idempotent way as the campaign tables above.
+      CREATE TABLE IF NOT EXISTS tenants (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          name VARCHAR(255) NOT NULL UNIQUE,
+          subdomain VARCHAR(100) NOT NULL UNIQUE,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS gateways (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          name VARCHAR(255) NOT NULL UNIQUE,
+          ip_address VARCHAR(100) NOT NULL UNIQUE,
+          sn VARCHAR(100) NOT NULL UNIQUE,
+          total_ports INTEGER DEFAULT 8,
+          status VARCHAR(50) DEFAULT 'online',
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS gateway_ports (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          gateway_id UUID NOT NULL REFERENCES gateways(id) ON DELETE CASCADE,
+          port_number INTEGER NOT NULL CHECK (port_number BETWEEN 0 AND 31),
+          tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
+          mapped_trunk_name VARCHAR(100),
+          status VARCHAR(50) DEFAULT 'idle',
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE (gateway_id, port_number)
+      );
+
+      CREATE TABLE IF NOT EXISTS gateway_port_telemetry (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          gateway_ip VARCHAR(100) NOT NULL,
+          port_number INTEGER NOT NULL,
+          sim_number VARCHAR(50),
+          signal_strength INTEGER DEFAULT 0,
+          registration_status VARCHAR(50) NOT NULL DEFAULT 'UNREGISTER',
+          call_state VARCHAR(50) DEFAULT 'Idle',
+          last_polled TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE (gateway_ip, port_number)
+      );
     `);
     console.log('[Database] ✅ Schema and Indexes automatically verified/created.');
   } catch (err) {
