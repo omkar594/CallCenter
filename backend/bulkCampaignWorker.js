@@ -109,12 +109,6 @@ async function getMaxConcurrentCalls() {
   }
 }
 
-// Optional escape hatch for clearing a queue backlog during testing: if set, leads belonging
-// to this campaign are claimed ahead of the normal oldest-first order, without touching or
-// requiring write access to anything else in the backlog. Unset (or leave blank) for normal
-// operation - this is a debugging aid, not a real priority-campaign feature.
-const PRIORITY_CAMPAIGN_ID = process.env.PRIORITY_CAMPAIGN_ID || null;
-
 async function claimNextPendingLead() {
   const result = await pool.query(`
     WITH target_lead AS (
@@ -122,7 +116,13 @@ async function claimNextPendingLead() {
       FROM campaign_leads cl
       JOIN voice_campaigns vc ON cl.campaign_id = vc.id
       WHERE cl.dial_status = 'pending' AND vc.status IN ('running', 'pending')
-      ORDER BY (cl.campaign_id = $1) DESC, cl.updated_at ASC
+      -- Claim a campaign's own leads to completion before moving to another campaign's
+      -- leads, ordering by the campaign's creation time (not the lead's own updated_at)
+      -- across the WHOLE table. Plain per-lead updated_at ordering let unrelated leftover
+      -- test campaigns interleave with (and starve) a brand-new campaign's own 2nd/3rd
+      -- lead, which looked like "the 2nd number never dials" even though the dialer itself
+      -- was working correctly per-call.
+      ORDER BY vc.created_at DESC, cl.updated_at ASC
       LIMIT 1
       FOR UPDATE OF cl SKIP LOCKED
     )
@@ -137,7 +137,7 @@ async function claimNextPendingLead() {
       target_lead.campaign_id,
       target_lead.audio_url,
       target_lead.allowed_ports;
-  `, [PRIORITY_CAMPAIGN_ID]);
+  `);
   return result.rows[0] || null;
 }
 
