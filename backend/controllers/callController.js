@@ -1,6 +1,7 @@
 import { executeTenantQuery } from '../config/database.js';
 import asteriskService from '../services/asteriskService.js';
 import routingService from '../services/routingService.js';
+import { syncAgentQueueMembership } from '../services/queueMembershipService.js';
 
 // Initiate outbound call (click-to-dial for Agents)
 export async function initiateOutboundCall(req, res) {
@@ -33,6 +34,7 @@ export async function initiateOutboundCall(req, res) {
     await executeTenantQuery(tenantId, `
       UPDATE agent_profiles SET current_status = 'offline', last_status_change = NOW() WHERE user_id = $1
     `, [agentId]);
+    syncAgentQueueMembership(agentId, 'offline').catch(() => {});
 
     // 3. Dial outbound using Asterisk AMI
     const channel = `PJSIP/${agentId}`;
@@ -100,10 +102,11 @@ export async function submitDisposition(req, res) {
 
     // 4. Release Agent: Set agent status back to 'idle' so they can take the next call
     await executeTenantQuery(tenantId, `
-      UPDATE agent_profiles 
-      SET current_status = 'idle', last_status_change = NOW() 
+      UPDATE agent_profiles
+      SET current_status = 'idle', last_status_change = NOW()
       WHERE user_id = $1
     `, [agentId]);
+    syncAgentQueueMembership(agentId, 'idle').catch(() => {});
 
     res.json({ message: 'Disposition submitted successfully, agent set to idle.' });
   } catch (error) {
@@ -144,6 +147,7 @@ export async function updateAgentBreakStatus(req, res) {
       await executeTenantQuery(tenantId, `
         UPDATE agent_profiles SET current_status = 'break', last_status_change = NOW() WHERE user_id = $1
       `, [agentId]);
+      syncAgentQueueMembership(agentId, 'break').catch(() => {});
 
       res.json({ message: `Agent went on ${breakType} break` });
 
@@ -159,6 +163,7 @@ export async function updateAgentBreakStatus(req, res) {
       await executeTenantQuery(tenantId, `
         UPDATE agent_profiles SET current_status = 'idle', last_status_change = NOW() WHERE user_id = $1
       `, [agentId]);
+      syncAgentQueueMembership(agentId, 'idle').catch(() => {});
 
       res.json({ message: 'Agent returned to idle' });
     } else {
@@ -319,11 +324,37 @@ export async function triggerLanguageTransfer(req, res) {
     await executeTenantQuery(tenantId, `
       UPDATE agent_profiles SET current_status = 'idle', last_status_change = NOW() WHERE user_id = $1
     `, [agentId]);
+    syncAgentQueueMembership(agentId, 'idle').catch(() => {});
 
     res.json({ message: 'Language re-routing initiated successfully.' });
 
   } catch (error) {
     console.error('triggerLanguageTransfer failed:', error);
     res.status(500).json({ error: 'Failed to process language transfer' });
+  }
+}
+
+// Moves an agent from 'login' to 'idle' - the missing "go ready" action noted while building
+// Workstream 7: login() only ever sets 'login', so without this an agent who just signed in
+// is never eligible for the inbound ACD queue OR the new campaign_agents queue.
+export async function setAgentReady(req, res) {
+  const agentId = req.user.id;
+  const tenantId = req.tenantId;
+
+  try {
+    const result = await executeTenantQuery(tenantId, `
+      UPDATE agent_profiles SET current_status = 'idle', last_status_change = NOW() WHERE user_id = $1
+      RETURNING id
+    `, [agentId]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent profile not found' });
+    }
+
+    syncAgentQueueMembership(agentId, 'idle').catch(() => {});
+    res.json({ message: 'Agent is now idle and ready for calls' });
+  } catch (error) {
+    console.error('setAgentReady failed:', error);
+    res.status(500).json({ error: 'Failed to set agent ready' });
   }
 }

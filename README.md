@@ -168,10 +168,15 @@ outbound_campaign_module/
 │   ├── routes/                         # Public Zero-Auth REST API endpoints
 │   └── services/                       # asteriskService (AMI), dinstarService, audioTranscoder, audioDeliveryService
 ├── telephony_config/                   # Asterisk Telephony Engine Settings
-│   ├── pjsip.conf                      # PJSIP Trunking to Dinstar Gateway
-│   ├── extensions.conf                 # Playback dialplan (reads from the Asterisk-local sounds dir)
-│   └── amd.conf                        # Answering Machine Detection Config
-├── frontend_component/                 # Reference React upload/status UI (no build tooling of its own)
+│   ├── pjsip.conf                      # PJSIP Trunking to Dinstar Gateway + WebRTC agent transport
+│   ├── extensions.conf                 # Dialplan: playback, AMD, DTMF menu, agent-queue transfer
+│   ├── amd.conf                        # Answering Machine Detection Config
+│   ├── queues.conf                     # campaign_agents queue - dynamic AMI-driven membership only
+│   ├── res_pgsql.conf                  # Asterisk Realtime DB connection (dynamic agent SIP endpoints)
+│   └── sorcery.conf                    # Maps res_pjsip endpoint/auth/aor lookups to Postgres
+├── frontend_component/
+│   ├── CampaignManagerUI.jsx           # Reference React upload/status UI (no build tooling of its own)
+│   └── agent_softphone/                # Minimal WebRTC agent softphone (JsSIP over WSS)
 └── database/                           # PostgreSQL Schema & Setup Scripts
     ├── schema.sql                      # Database Schema (Campaigns, Leads, Telemetry) - kept in sync with server.js's initSchema()
     ├── seed.sql                        # Sample Test Data
@@ -205,12 +210,22 @@ npm start
 
 ### 5.1 Asterisk on EC2
 1. Copy `telephony_config/*.conf` into `/etc/asterisk/`, reload (`asterisk -rx "core reload"`).
-2. In `telephony_config/extensions.conf`, set the `CAMPAIGN_CALLBACK_BASE` global to your actual Render service URL (this is only a best-effort secondary status signal; the backend's own AMI event tracking is authoritative).
+2. In `telephony_config/extensions.conf`, set the `CAMPAIGN_CALLBACK_BASE` global to your actual Render service URL - used only by the DTMF-9 opt-out webhook (`CURL()` right before that call's `Hangup()`); it is not a mid-call status signal and cannot race the dialer's own AMI event tracking the way an earlier version of this file did.
 3. Open port `5038` (AMI) in the EC2 security group, scoped to Render's egress IPs if possible - do not expose AMI to the whole internet.
 4. Create a dedicated `campaign-uploader` SSH user, chrooted via `sshd_config`'s `ChrootDirectory /var/lib/asterisk/sounds` + `ForceCommand internal-sftp`, so it can only reach that one directory tree and has no shell access - do not reuse a full-access SSH key for this. `ASTERISK_SOUNDS_DIR` is then set relative to that chroot (`/campaign_audio`, not the full host path). Open port `22` to Render's egress for this user.
+5. Confirm the `AMD` module is loaded (`asterisk -rx "module show like amd"`) - `telephony_config/amd.conf` already ships with sane defaults, nothing to tune before first use.
+6. Record and deliver three short static prompts to the sounds directory the same way campaign audio is delivered (one-time, manual): `dtmf_menu_options` (menu instructions), `optout_confirmation`, `agents_unavailable`.
 
 ### 5.2 Backend on Render
 1. Use the included `render.yaml` Blueprint (New > Blueprint in the Render dashboard, pointing at this repo) so the service config (root dir `backend`, build/start commands, health check) is reproducible instead of dashboard-only.
 2. Fill in the env vars flagged `sync: false` in `render.yaml` via the Render dashboard - notably `DATABASE_URL`, `ASTERISK_AMI_HOST/USER/PASS`, `DINSTAR_*`, and `ASTERISK_SSH_HOST/USER`.
 3. Upload your SSH private key for audio delivery as a Render **Secret File** named `asterisk_deploy_key` (mounted at `/etc/secrets/asterisk_deploy_key`, matching `ASTERISK_SSH_PRIVATE_KEY_PATH`'s default). Never commit this key to the repo.
 4. Confirm `/health` reports real connectivity for Postgres, Redis, and Asterisk AMI (this now performs live checks rather than just confirming the client objects exist).
+
+### 5.3 Live-agent transfer setup (Workstream 7)
+This is the part of the deploy that needs the most hands-on EC2 work - budget real time for it, it's infrastructure, not a config copy.
+1. **Asterisk Realtime for dynamic agent SIP endpoints:** install `res_config_pgsql` (`asterisk -rx "module show like res_config_pgsql"` to check first), fill in `telephony_config/res_pgsql.conf` with the SAME Postgres connection details as the backend's `DATABASE_URL`, then copy it and `sorcery.conf` into `/etc/asterisk/` alongside the others. **The EC2 box must be able to reach that Postgres instance** - if it's a managed DB that only allowlists Render's egress IPs, add the EC2 box's IP too, or this silently fails to find any agent endpoints.
+2. Copy `telephony_config/queues.conf` into `/etc/asterisk/` as well - no per-agent edits needed here, membership is 100% AMI-driven from Postgres (see `backend/services/queueMembershipService.js`).
+3. Create at least one agent via `POST /api/auth/agents` (see Section 1) so there's someone for `campaign_agents` to actually ring.
+4. **Agent softphone (`frontend_component/agent_softphone/`):** open EC2 security-group port `8089` (WSS) to wherever agents work. Put a **real TLS certificate** on that WSS transport (browsers reject WebRTC microphone access on self-signed WSS in practice) - either directly on Asterisk's `[transport-wss]` cert fields in `pjsip.conf`, or via an nginx/ALB reverse proxy terminating TLS in front of it. Each agent needs a machine with a working microphone - that, not additional SIM cards, is the actual new physical resource this feature requires (a press-1 transfer bridges the SAME already-connected Dinstar channel, it never dials out a second time).
+5. Set `ASTERISK_WSS_URL` on Render to the public `wss://<host>:8089/ws` agents' browsers will actually reach (not `127.0.0.1`).

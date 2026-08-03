@@ -2,6 +2,10 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Drop existing tables if they exist
+DROP TABLE IF EXISTS ps_endpoints CASCADE;
+DROP TABLE IF EXISTS ps_auths CASCADE;
+DROP TABLE IF EXISTS ps_aors CASCADE;
+DROP TABLE IF EXISTS dnc_numbers CASCADE;
 DROP TABLE IF EXISTS campaign_leads CASCADE;
 DROP TABLE IF EXISTS voice_campaigns CASCADE;
 DROP TABLE IF EXISTS gateway_port_telemetry CASCADE;
@@ -46,6 +50,7 @@ CREATE TABLE agent_profiles (
     current_language VARCHAR(50) DEFAULT 'English',
     daily_transfer_count INTEGER DEFAULT 0,
     is_temporary_blocked BOOLEAN DEFAULT FALSE,
+    sip_secret VARCHAR(255), -- Workstream 7: generated SIP password for the agent's WebRTC softphone
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -224,8 +229,55 @@ CREATE TABLE campaign_leads (
     dial_status VARCHAR(50) DEFAULT 'pending',
     call_duration INTEGER DEFAULT 0,
     attempts INTEGER DEFAULT 0,
+    amd_status VARCHAR(20), -- Workstream 7: HUMAN/MACHINE/NOTSURE from the dialplan's AMD()
+    dtmf_selected VARCHAR(20), -- Workstream 7: which DTMF menu option the caller picked, if any
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 14. Do-Not-Call / opt-out list (Workstream 7) - checked before every campaign upload so an
+-- opted-out number (DTMF 9) is never dialed again regardless of which future CSV it appears in.
+CREATE TABLE dnc_numbers (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    phone_number VARCHAR(50) NOT NULL UNIQUE,
+    reason VARCHAR(100) DEFAULT 'caller_opt_out',
+    source_campaign_id UUID REFERENCES voice_campaigns(id) ON DELETE SET NULL,
+    source_lead_id UUID REFERENCES campaign_leads(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_dnc_phone ON dnc_numbers(phone_number);
+
+-- 15. Asterisk Realtime Architecture tables (Workstream 7) - dynamic per-agent SIP endpoints.
+-- res_config_pgsql on the EC2 Asterisk box reads these directly (see telephony_config/sorcery.conf
+-- + res_pgsql.conf) instead of static pjsip.conf endpoints, since realtime rows don't inherit
+-- pjsip.conf's `(!)` templates - every field an agent endpoint needs must be written explicitly.
+CREATE TABLE ps_endpoints (
+    id VARCHAR(255) PRIMARY KEY, -- = users.id (UUID as text)
+    transport VARCHAR(255) DEFAULT 'transport-wss',
+    aors VARCHAR(255),
+    auth VARCHAR(255),
+    context VARCHAR(255) DEFAULT 'incoming-webrtc-context',
+    disallow VARCHAR(255) DEFAULT 'all',
+    allow VARCHAR(255) DEFAULT 'alaw,ulaw',
+    webrtc VARCHAR(5) DEFAULT 'yes',
+    ice_support VARCHAR(5) DEFAULT 'yes',
+    use_avpf VARCHAR(5) DEFAULT 'yes',
+    media_encryption VARCHAR(20) DEFAULT 'dtls',
+    dtls_verify VARCHAR(5) DEFAULT 'no',
+    dtls_setup VARCHAR(20) DEFAULT 'actpass',
+    dtls_auto_generate_cert VARCHAR(5) DEFAULT 'yes',
+    rtcp_mux VARCHAR(5) DEFAULT 'yes'
+);
+CREATE TABLE ps_auths (
+    id VARCHAR(255) PRIMARY KEY,
+    auth_type VARCHAR(40) DEFAULT 'userpass',
+    username VARCHAR(255),
+    password VARCHAR(255)
+);
+CREATE TABLE ps_aors (
+    id VARCHAR(255) PRIMARY KEY,
+    max_contacts INTEGER DEFAULT 1,
+    remove_existing VARCHAR(5) DEFAULT 'yes'
 );
 
 CREATE INDEX IF NOT EXISTS idx_leads_dial_status ON campaign_leads(dial_status, updated_at);

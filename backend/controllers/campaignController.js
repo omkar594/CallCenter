@@ -6,6 +6,7 @@ import os from 'os';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { transcodeCampaignAudio } from '../services/audioTranscoder.js';
 import { deliverCampaignAudio } from '../services/audioDeliveryService.js';
+import { normalizePhoneNumber } from '../utils/phoneNormalizer.js';
 
 const PHONE_HEADER_ALIASES = ['phone', 'phone_number', 'phonenumber', 'number', 'mobile', 'msisdn'];
 const NAME_HEADER_ALIASES = ['name', 'customer_name', 'customername', 'full_name'];
@@ -55,6 +56,40 @@ export async function handleCampaignCallback(req, res) {
     res.send('OK');
   } catch (error) {
     console.error('[Campaign Callback] Database update failed:', error.message);
+    res.status(500).send(error.message);
+  }
+}
+
+// Workstream 7: hit via CURL() from the dialplan's DTMF-9 branch. Must respond fast - the
+// caller's channel is blocked on this CURL() before it can play the confirmation prompt and
+// hang up, so func_curl's timeout option on the dialplan side is what protects the caller if
+// this endpoint is ever slow/unreachable, not anything here.
+export async function handleOptOutWebhook(req, res) {
+  const { leadId, phone } = req.query;
+
+  if (!phone) {
+    return res.status(400).send('Missing phone');
+  }
+
+  const normalized = normalizePhoneNumber(phone);
+
+  try {
+    await pool.query(`
+      INSERT INTO dnc_numbers (phone_number, source_lead_id)
+      VALUES ($1, $2)
+      ON CONFLICT (phone_number) DO NOTHING
+    `, [normalized, leadId || null]);
+
+    if (leadId) {
+      await pool.query(`
+        UPDATE campaign_leads SET dial_status = 'opted_out', updated_at = NOW() WHERE id = $1
+      `, [leadId]);
+    }
+
+    console.log(`[Opt-Out] ${normalized} added to do-not-call list (lead ${leadId || 'n/a'})`);
+    res.send('OK');
+  } catch (error) {
+    console.error('[Opt-Out] Failed to record opt-out:', error.message);
     res.status(500).send(error.message);
   }
 }
@@ -191,6 +226,36 @@ export async function createBroadcastCampaign(req, res) {
     return res.status(400).json({ error: 'No valid target phone numbers provided (upload leadsCsv or pass phoneNumbers in JSON)' });
   }
 
+  // Workstream 7: drop any number that opted out (DTMF 9) in a previous campaign, checked
+  // before any transcode/SFTP work happens so a fully-opted-out upload fails fast. Uses the
+  // SAME normalizePhoneNumber() the dialplan's opt-out webhook writes with, and the worker
+  // dials with, so a number written as "+919876543210" here still matches one opted out as
+  // a bare "9876543210" (or vice versa) - matching normalization everywhere is what makes
+  // this list actually enforceable rather than just occasionally effective.
+  let excludedDncCount = 0;
+  {
+    const normalizedToLead = new Map();
+    for (const lead of leads) {
+      normalizedToLead.set(normalizePhoneNumber(lead.phoneNumber), lead);
+    }
+    const dncResult = await executeTenantQuery(null,
+      `SELECT phone_number FROM dnc_numbers WHERE phone_number = ANY($1)`,
+      [[...normalizedToLead.keys()]]
+    );
+    for (const row of dncResult.rows) {
+      normalizedToLead.delete(row.phone_number);
+    }
+    excludedDncCount = leads.length - normalizedToLead.size;
+    leads = [...normalizedToLead.values()];
+  }
+
+  if (leads.length === 0) {
+    return res.status(400).json({
+      error: 'No valid target phone numbers provided (upload leadsCsv or pass phoneNumbers in JSON)',
+      excludedDncCount
+    });
+  }
+
   // Parse allowed ports string/array (e.g. [0, 1] or "0,1")
   let parsedPorts = 'all';
   if (allowedPorts) {
@@ -284,6 +349,7 @@ export async function createBroadcastCampaign(req, res) {
       campaignId: campaign.id,
       name: campaign.name,
       totalLeads: leads.length,
+      excludedDncCount,
       allowedPorts: parsedPorts,
       status: 'running'
     });

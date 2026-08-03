@@ -33,6 +33,7 @@ class AsteriskService extends EventEmitter {
     if (this.useMock) {
       console.warn('[AsteriskService] AMI_MOCK_MODE=true - using the AMI simulator, not a real Asterisk connection.');
       this.isConnected = true;
+      this.emit('ami_ready');
       return true;
     }
 
@@ -52,6 +53,10 @@ class AsteriskService extends EventEmitter {
           if (response.Response === 'Success') {
             console.log('Successfully authenticated with Asterisk AMI');
             this.isConnected = true;
+            // Lets queueMembershipService resync campaign_agents queue membership against
+            // Postgres on every (re)connect, including after Asterisk restarts where any
+            // AMI-only queue state would otherwise be lost - see Workstream 7.
+            this.emit('ami_ready');
             resolve(true);
           } else {
             console.error('Asterisk AMI Authentication failed:', response.Message);
@@ -213,6 +218,21 @@ class AsteriskService extends EventEmitter {
    */
   async hangupChannel(channel) {
     return this.sendAction('Hangup', { Channel: channel });
+  }
+
+  /**
+   * Adds/removes a dynamic member from an Asterisk queue (queues.conf). Used by
+   * queueMembershipService.js to keep the `campaign_agents` queue's live membership in sync
+   * with agent_profiles.current_status - Postgres stays the single source of truth for who's
+   * idle, Asterisk's queue membership is just a mirror of it. No AMI Bridge/Transfer action is
+   * needed for the press-1-to-agent feature - Queue() bridges natively inside the dialplan.
+   */
+  async queueAdd(queue, interfaceName, opts = {}) {
+    return this.sendAction('QueueAdd', { Queue: queue, Interface: interfaceName, Penalty: 0, ...opts });
+  }
+
+  async queueRemove(queue, interfaceName) {
+    return this.sendAction('QueueRemove', { Queue: queue, Interface: interfaceName });
   }
 
   /**

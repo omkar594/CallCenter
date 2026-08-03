@@ -3,7 +3,7 @@ import multer from 'multer';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
-import { getCampaigns, getCampaignReport, createBroadcastCampaign, handleCampaignCallback } from '../controllers/campaignController.js';
+import { getCampaigns, getCampaignReport, createBroadcastCampaign, handleCampaignCallback, handleOptOutWebhook } from '../controllers/campaignController.js';
 
 const AUDIO_FIELDS = new Set(['broadcastAudio', 'audioFile', 'audio', 'file']);
 const CSV_FIELDS = new Set(['leadsCsv', 'csv']);
@@ -64,6 +64,11 @@ router.post('/broadcast', optionalUpload, createBroadcastCampaign);
 // 3. Webhook for Asterisk dialplan to report call status. MUST be registered before '/:id'
 // or Express matches it as a campaign id lookup instead (see server.js history for the bug this fixes).
 router.get('/callback', handleCampaignCallback);
+
+// 3b. Workstream 7: DTMF-9 opt-out webhook, hit via CURL() from the dialplan the same way
+// /callback is - GET with a query string, since func_curl defaults to GET. Also registered
+// before '/:id' for the same route-shadowing reason as above.
+router.get('/optout', handleOptOutWebhook);
 
 // 4. Get campaign detailed status & call progress
 router.get('/:id', getCampaignReport);

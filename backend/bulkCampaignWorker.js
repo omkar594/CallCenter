@@ -1,6 +1,7 @@
 import pg from 'pg';
 import dotenv from 'dotenv';
 import asteriskService from './services/asteriskService.js';
+import { normalizePhoneNumber } from './utils/phoneNormalizer.js';
 
 dotenv.config();
 
@@ -14,6 +15,14 @@ const ORIGINATE_RESPONSE_TIMEOUT_MS = ORIGINATE_RING_TIMEOUT_MS + 20000;
 // a Hangup event (covers a dropped/missed event - the SIM channel physically stays busy
 // through ringing + the voice prompt, so this must comfortably exceed both).
 const MAX_CALL_DURATION_MS = parseInt(process.env.MAX_CALL_DURATION_MS) || 5 * 60 * 1000;
+// Workstream 7: once a call is transferred to a live agent (dialplan emits
+// UserEvent(AgentTransferStart,...) - see extensions.conf), the channel can legitimately stay
+// busy far longer than an ordinary broadcast prompt. Using MAX_CALL_DURATION_MS as the cap for
+// a transferred call would free its concurrency slot mid-conversation while the SIM port is
+// still physically busy, letting a second lead dial out onto a line that isn't actually free -
+// the same SIP 480/503 collision this project already fixed once for the plain-broadcast case.
+// Ordinary (non-transferred) calls are completely unaffected by this constant.
+const MAX_AGENT_CALL_DURATION_MS = parseInt(process.env.MAX_AGENT_CALL_DURATION_MS) || 2 * 60 * 60 * 1000;
 // DB-level backstop for leads still stuck 'processing' after a worker crash/restart lost
 // its in-memory event listeners entirely.
 const STALE_LEAD_TIMEOUT_SEC = parseInt(process.env.STALE_LEAD_TIMEOUT_SEC) || 400;
@@ -60,22 +69,6 @@ function pickPort(allowedPorts, campaignId) {
   const targetPort = portList[idx];
   campaignPortCounters[campaignId]++;
   return { targetPort, label: `Selected Port ${targetPort} (out of restricted ports: [${portList.join(', ')}])` };
-}
-
-// India-only normalization, matching the SIMs this gateway currently carries. A genuine
-// 12-digit non-Indian number that happens to start with "91" will be mis-stripped - extend
-// this (or bring in a real phone-number library) before dialing outside India.
-function normalizePhoneNumber(rawNumber) {
-  const raw = String(rawNumber).trim();
-  let digits = raw.replace(/[^0-9]/g, '');
-  if (raw.startsWith('+91') && digits.length === 12) {
-    digits = digits.substring(2);
-  } else if (digits.startsWith('91') && digits.length === 12) {
-    digits = digits.substring(2);
-  } else if (digits.startsWith('0') && digits.length === 11) {
-    digits = digits.substring(1);
-  }
-  return digits;
 }
 
 // Best-effort mapping of AMI OriginateResponse "Reason" codes. Exact values vary slightly
@@ -165,8 +158,16 @@ async function requeueLead(leadId) {
 }
 
 async function finalizeLead(leadId, campaignId, dialStatus, durationSec) {
+  // Workstream 7: a caller who presses 9 gets marked 'opted_out' by the opt-out webhook
+  // (campaignController.js's handleOptOutWebhook) WHILE the call is still up - the real Hangup
+  // this function reacts to fires moments later, and without the CASE guard below would
+  // overwrite 'opted_out' back to 'answered' since the call genuinely did answer. Once a lead
+  // is opted_out, that's terminal - never let the normal answered/busy/failed finalize clobber it.
   await pool.query(
-    `UPDATE campaign_leads SET dial_status = $1, call_duration = $2, updated_at = NOW() WHERE id = $3`,
+    `UPDATE campaign_leads
+     SET dial_status = CASE WHEN dial_status = 'opted_out' THEN dial_status ELSE $1 END,
+         call_duration = $2, updated_at = NOW()
+     WHERE id = $3`,
     [dialStatus, durationSec, leadId]
   );
   await pool.query(
@@ -248,14 +249,30 @@ async function dispatchLead(lead) {
   }
 
   // Call connected - the SIM channel stays genuinely busy through ringing + prompt playback,
-  // so keep this lead 'processing' (holding a concurrency slot) until the real Hangup.
+  // so keep this lead 'processing' (holding a concurrency slot) until the real Hangup. Race
+  // that against an AgentTransferStart marker (Workstream 7) so a press-1 transfer switches
+  // to the much longer MAX_AGENT_CALL_DURATION_MS cap instead of the ordinary one.
   const uniqueid = originateResponse.Uniqueid;
-  const hangupEvent = uniqueid
-    ? await asteriskService.waitForEvent('Hangup', (evt) => evt.Uniqueid === uniqueid, MAX_CALL_DURATION_MS)
-    : null;
+  let hangupEvent = null;
+
+  if (uniqueid) {
+    const raceResult = await Promise.race([
+      asteriskService.waitForEvent('Hangup', (evt) => evt.Uniqueid === uniqueid, MAX_CALL_DURATION_MS)
+        .then((evt) => ({ kind: 'hangup', evt })),
+      asteriskService.waitForEvent('UserEvent', (evt) => evt.UserEvent === 'AgentTransferStart' && evt.Uniqueid === uniqueid, MAX_CALL_DURATION_MS)
+        .then((evt) => ({ kind: 'transfer', evt }))
+    ]);
+
+    if (raceResult.kind === 'transfer' && raceResult.evt) {
+      console.log(`[Worker] Lead ${lead.lead_id}: transferred to a live agent - extending hold to ${MAX_AGENT_CALL_DURATION_MS}ms`);
+      hangupEvent = await asteriskService.waitForEvent('Hangup', (evt) => evt.Uniqueid === uniqueid, MAX_AGENT_CALL_DURATION_MS);
+    } else {
+      hangupEvent = raceResult.evt;
+    }
+  }
 
   if (!hangupEvent) {
-    console.warn(`[Worker] Lead ${lead.lead_id}: answered but no Hangup event within ${MAX_CALL_DURATION_MS}ms - freeing the slot anyway`);
+    console.warn(`[Worker] Lead ${lead.lead_id}: answered but no Hangup event within the cap - freeing the slot anyway`);
   }
 
   const durationSec = Math.round((Date.now() - dispatchedAt) / 1000);

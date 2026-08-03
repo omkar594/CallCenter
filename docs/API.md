@@ -67,10 +67,12 @@ curl -X POST https://callcenter-edpl.onrender.com/api/campaigns/broadcast \
   "campaignId": "186c7a11-f2da-4a51-bacd-215c4cbbcbf6",
   "name": "Q3_Sales_Campaign",
   "totalLeads": 2,
+  "excludedDncCount": 0,
   "allowedPorts": "0,1",
   "status": "running"
 }
 ```
+`excludedDncCount` is how many uploaded numbers were silently dropped because they're on the do-not-call list (see §6) — normalized the same way as the outbound dialer, so a number opted out as `9876543210` is still caught if this upload has it as `+919876543210`.
 
 **Error responses** (`400`): missing `name`, missing audio, missing numbers/CSV, wrong file MIME type, invalid CSV. (`500`): audio transcode failed, audio delivery to Asterisk failed (SSH not configured/unreachable), database error.
 
@@ -124,7 +126,9 @@ curl https://callcenter-edpl.onrender.com/api/campaigns/186c7a11-f2da-4a51-bacd-
 }
 ```
 
-`dial_status` values: `pending` → `processing` → one of `answered` / `busy` / `no-answer` / `failed`. These reflect **real Asterisk call-completion events** (AMI `OriginateResponse`/`Hangup`), not just "the dial request was accepted."
+`dial_status` values: `pending` → `processing` → one of `answered` / `busy` / `no-answer` / `failed` / `opted_out`. These reflect **real Asterisk call-completion events** (AMI `OriginateResponse`/`Hangup`), not just "the dial request was accepted." `opted_out` is set the moment a caller presses 9 (see §5) and is never overwritten by the normal answered/busy/failed finalize, even though the call is usually still technically "answered" at that point.
+
+Two extra columns populated by the dialplan's DTMF menu (§5), also present in each lead object: `amd_status` (`HUMAN`/`MACHINE`/`NOTSURE`, from Asterisk's `AMD()`) and `dtmf_selected` (currently just `"1"` when the caller transferred to an agent).
 
 ### 2.4 How call concurrency and `allowedPorts` actually work
 
@@ -173,12 +177,35 @@ Separate subsystem in the same backend — a multi-tenant agent desk with ACD ro
 - `GET /api/analytics/live` — dashboard: agent status counts, today's conversions, queue volume, SLA breaches.
 - `GET /api/analytics/logs` — last 100 calls with disposition/agent info.
 
+### 4.4 Agent provisioning & readiness (Workstream 7)
+- `POST /api/auth/agents` — role: `super_admin`/`client_admin`/`team_leader`. Body `{ username, password, parentId? }` → creates the `users`+`agent_profiles` rows and provisions a SIP softphone identity. Response includes `sip: { sipUsername, sipPassword }` — the only time the raw password is returned; afterwards it's fetched via the next endpoint.
+- `GET /api/auth/me/sip-credentials` — any authenticated **agent**. Returns `{ sipUsername, sipPassword, wssUrl }` for the agent softphone (`frontend_component/agent_softphone/`) to register with. Lazily provisions on first call, so agents created before this feature existed work with no manual step.
+- `POST /api/calls/ready` — role: `agent`. Moves the caller from `login` to `idle`, making them eligible for both the inbound ACD queue and the campaign agent-transfer queue. (Logging in alone does **not** do this — see §5.)
+
 ---
 
-## 5. Known limitations to tell the other developer about
+## 5. Live-agent transfer, DTMF menu, AMD & do-not-call (Workstream 7)
+
+The campaign dialplan now supports more than "play a message and hang up":
+
+- **Answering-machine detection** runs first (`AMD()`). If it detects a machine, the message plays once with no menu offered — pressing digits on a voicemail greeting does nothing.
+- For a human (or an ambiguous `NOTSURE` result — treated as human rather than risking a silent drop), the message plays **interruptibly** and a DTMF menu is offered:
+  - **1** — transfer to a live agent via Asterisk's `Queue()` (hold music if all agents are busy; an apology message if none are online at all).
+  - **2** — repeat the message.
+  - **9** — opt out. Recorded to the do-not-call list and excluded from all future campaign uploads (see `excludedDncCount` in §2.1).
+- Agents must explicitly call `POST /api/calls/ready` after logging in before they're eligible to receive a transferred call — `POST /api/auth/login` alone only sets them to `login`, not `idle`.
+- **No new SIM/GSM hardware is needed for this feature.** A transfer bridges the *same already-connected* call to an agent's softphone — it never dials out through Dinstar a second time. What it *does* need: at least one agent with a provisioned SIP identity (§4.4) actually running the softphone with a working microphone.
+- The opt-out webhook the dialplan calls (`GET /api/campaigns/optout?leadId=...&phone=...`) is zero-auth, same trust model as `/callback` — not meant to be called directly by an external integrator, just documented for completeness.
+
+---
+
+## 6. Known limitations to tell the other developer about
 
 - **No auth on the Campaign/Gateway APIs.** Add an API-key layer before exposing this URL beyond trusted use.
 - **No rate limiting.**
 - **`allowedPorts` is advisory, not enforced** — see §2.4.
 - **India-only phone normalization** (`bulkCampaignWorker.js`) — strips a `91` country code prefix; not tested against other countries.
 - CSV/number list dedup is exact-string match only (no phone-number canonicalization across formats).
+- **Agent SIP endpoints require Asterisk Realtime (`res_config_pgsql`) to be installed and configured on the EC2 box** (§5.3 of the README) — `POST /api/auth/agents`/`GET /api/auth/me/sip-credentials` will provision Postgres rows either way, but the agent's softphone can't actually register until that's set up.
+- **The agent softphone needs a real TLS certificate on the WSS transport** — browsers reject WebRTC microphone access on self-signed WSS in practice; this is a manual EC2/infra step, not something either endpoint above can fix.
+- `campaign_agents` queue strategy is `leastrecent` with no skills-based routing (language, campaign type, etc.) — every idle agent is treated as interchangeable for a transferred call.

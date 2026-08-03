@@ -12,6 +12,7 @@ import redis from './config/redis.js';
 import asteriskService from './services/asteriskService.js';
 import spamService from './services/spamService.js';
 import routingService from './services/routingService.js';
+import { resyncAllIdleAgents } from './services/queueMembershipService.js';
 import { executeTenantQuery } from './config/database.js';
 
 // Import routes
@@ -26,6 +27,8 @@ import './bulkCampaignWorker.js';
 // Start Dinstar gateway telemetry poller (previously never imported, so gateway_port_telemetry
 // never populated in the deployed process - see plan Workstream 4).
 import './dinstarPoller.js';
+// Workstream 7: records AMD/DTMF dialplan markers onto campaign_leads for reporting.
+import './services/campaignTelemetryListener.js';
 
 dotenv.config();
 
@@ -40,6 +43,13 @@ const io = new Server(server, {
 
 // Expose Socket.io globally for real-time escalations
 global.io = io;
+
+// Keep the `campaign_agents` Asterisk queue's membership in sync with Postgres on every AMI
+// (re)connect - including after an Asterisk restart, where queues.conf's persistentmembers=no
+// means the queue otherwise comes back empty until each agent's next unrelated status change.
+asteriskService.on('ami_ready', () => {
+  resyncAllIdleAgents().catch((err) => console.error('[QueueMembership] Resync on ami_ready failed:', err.message));
+});
 
 // Ensure upload static directories exist on server boot
 const uploadsDir = path.resolve(process.cwd(), 'uploads');
@@ -57,6 +67,9 @@ const audioUploadsDir = path.resolve(process.cwd(), 'uploads', 'campaign_audio')
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static(uploadsDir));
+// Workstream 7: minimal WebRTC agent softphone (frontend_component/agent_softphone/) - served
+// from the same origin so its relative fetch('/api/...') calls need no CORS/base-URL config.
+app.use('/agent-softphone', express.static(path.resolve(process.cwd(), '..', 'frontend_component', 'agent_softphone')));
 
 // Mount API routes
 app.use('/api/auth', authRoutes);
@@ -147,6 +160,161 @@ async function initSchema() {
           call_state VARCHAR(50) DEFAULT 'Idle',
           last_polled TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
           UNIQUE (gateway_ip, port_number)
+      );
+
+      -- Contact Center / Agent-desk tables (routes/auth.js, routes/call.js, routingService.js).
+      -- Same root cause as the gateway tables above: schema.sql defines these but was never
+      -- actually run against production - only this function was. Without them every agent-desk
+      -- endpoint (agent login, /api/calls/*, /api/analytics/*) 500s the same way GET /api/gateways
+      -- did, and the press-1-to-agent feature (Workstream 7) needs agent_profiles/users to exist
+      -- to function at all.
+      INSERT INTO tenants (id, name, subdomain)
+      VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'Default Tenant', 'default')
+      ON CONFLICT (id) DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS users (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+          username VARCHAR(150) NOT NULL UNIQUE,
+          password_hash VARCHAR(255) NOT NULL,
+          role VARCHAR(50) NOT NULL CHECK (role IN ('super_admin', 'client_admin', 'mentor', 'team_leader', 'agent')),
+          parent_id UUID REFERENCES users(id) ON DELETE SET NULL,
+          status VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_profiles (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+          current_status VARCHAR(50) DEFAULT 'offline' CHECK (current_status IN ('offline', 'login', 'idle', 'break', 'holiday')),
+          last_status_change TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          current_language VARCHAR(50) DEFAULT 'English',
+          daily_transfer_count INTEGER DEFAULT 0,
+          is_temporary_blocked BOOLEAN DEFAULT FALSE,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+      -- Workstream 7: holds each agent's generated SIP password so /api/auth/me/sip-credentials
+      -- can return it without re-generating a new one (and breaking an already-registered
+      -- softphone) on every call.
+      ALTER TABLE agent_profiles ADD COLUMN IF NOT EXISTS sip_secret VARCHAR(255);
+
+      CREATE TABLE IF NOT EXISTS agent_breaks (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          agent_profile_id UUID NOT NULL REFERENCES agent_profiles(id) ON DELETE CASCADE,
+          break_type VARCHAR(50) NOT NULL CHECK (break_type IN ('tea', 'lunch', 'meeting', 'other')),
+          start_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          end_time TIMESTAMP WITH TIME ZONE
+      );
+
+      CREATE TABLE IF NOT EXISTS campaigns (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          name VARCHAR(255) NOT NULL,
+          type VARCHAR(50) DEFAULT 'outbound' CHECK (type IN ('inbound', 'outbound')),
+          status VARCHAR(50) DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS dispositions (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          code VARCHAR(100) NOT NULL,
+          description VARCHAR(255),
+          is_resolved BOOLEAN DEFAULT FALSE,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(tenant_id, code)
+      );
+
+      CREATE TABLE IF NOT EXISTS calls (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          campaign_id UUID REFERENCES campaigns(id) ON DELETE SET NULL,
+          caller_number VARCHAR(50) NOT NULL,
+          callee_number VARCHAR(50) NOT NULL,
+          agent_id UUID REFERENCES users(id) ON DELETE SET NULL,
+          direction VARCHAR(50) NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+          status VARCHAR(50) DEFAULT 'queued' CHECK (status IN ('queued', 'ringing', 'active', 'completed', 'missed', 'failed')),
+          start_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          answer_time TIMESTAMP WITH TIME ZONE,
+          end_time TIMESTAMP WITH TIME ZONE,
+          duration INTEGER DEFAULT 0,
+          recording_url VARCHAR(512),
+          disposition_id UUID REFERENCES dispositions(id) ON DELETE SET NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS buckets (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          agent_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          customer_number VARCHAR(50) NOT NULL,
+          customer_name VARCHAR(255),
+          assigned_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          sla_deadline TIMESTAMP WITH TIME ZONE NOT NULL,
+          status VARCHAR(50) DEFAULT 'pending' CHECK (status IN ('pending', 'resolved', 'escalated')),
+          is_sla_breached BOOLEAN DEFAULT FALSE,
+          call_id UUID REFERENCES calls(id) ON DELETE SET NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS escalations (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          call_id UUID REFERENCES calls(id) ON DELETE SET NULL,
+          bucket_id UUID REFERENCES buckets(id) ON DELETE SET NULL,
+          from_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+          to_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+          reason VARCHAR(255) NOT NULL,
+          status VARCHAR(50) DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      -- Workstream 7: do-not-call / opt-out compliance
+      CREATE TABLE IF NOT EXISTS dnc_numbers (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          phone_number VARCHAR(50) NOT NULL UNIQUE,
+          reason VARCHAR(100) DEFAULT 'caller_opt_out',
+          source_campaign_id UUID REFERENCES voice_campaigns(id) ON DELETE SET NULL,
+          source_lead_id UUID REFERENCES campaign_leads(id) ON DELETE SET NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_dnc_phone ON dnc_numbers(phone_number);
+
+      ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS amd_status VARCHAR(20);
+      ALTER TABLE campaign_leads ADD COLUMN IF NOT EXISTS dtmf_selected VARCHAR(20);
+
+      -- Workstream 7: Asterisk Realtime Architecture tables for dynamic per-agent SIP endpoints.
+      -- res_config_pgsql on the EC2 box reads these directly (see telephony_config/sorcery.conf +
+      -- res_pgsql.conf) - column set matches what chan_pjsip's realtime backend expects; cross-
+      -- check against the installed Asterisk version's realtime sample config if an endpoint
+      -- fails to register after provisioning.
+      CREATE TABLE IF NOT EXISTS ps_endpoints (
+          id VARCHAR(255) PRIMARY KEY,
+          transport VARCHAR(255) DEFAULT 'transport-wss',
+          aors VARCHAR(255),
+          auth VARCHAR(255),
+          context VARCHAR(255) DEFAULT 'incoming-webrtc-context',
+          disallow VARCHAR(255) DEFAULT 'all',
+          allow VARCHAR(255) DEFAULT 'alaw,ulaw',
+          webrtc VARCHAR(5) DEFAULT 'yes',
+          ice_support VARCHAR(5) DEFAULT 'yes',
+          use_avpf VARCHAR(5) DEFAULT 'yes',
+          media_encryption VARCHAR(20) DEFAULT 'dtls',
+          dtls_verify VARCHAR(5) DEFAULT 'no',
+          dtls_setup VARCHAR(20) DEFAULT 'actpass',
+          dtls_auto_generate_cert VARCHAR(5) DEFAULT 'yes',
+          rtcp_mux VARCHAR(5) DEFAULT 'yes'
+      );
+      CREATE TABLE IF NOT EXISTS ps_auths (
+          id VARCHAR(255) PRIMARY KEY,
+          auth_type VARCHAR(40) DEFAULT 'userpass',
+          username VARCHAR(255),
+          password VARCHAR(255)
+      );
+      CREATE TABLE IF NOT EXISTS ps_aors (
+          id VARCHAR(255) PRIMARY KEY,
+          max_contacts INTEGER DEFAULT 1,
+          remove_existing VARCHAR(5) DEFAULT 'yes'
       );
     `);
     console.log('[Database] ✅ Schema and Indexes automatically verified/created.');

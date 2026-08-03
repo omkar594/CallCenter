@@ -1,6 +1,7 @@
 import { executeTenantQuery } from '../config/database.js';
 import asteriskService from './asteriskService.js';
 import redis from '../config/redis.js';
+import { syncAgentQueueMembership } from './queueMembershipService.js';
 
 // Holds live routing state mapping callId to active dialing parameters
 const activeRoutingSessions = new Map();
@@ -59,10 +60,11 @@ class RoutingService {
       console.log(`[ACD] Selected agent ${agent.username} (${agent.id}) - Idle since: ${agent.last_status_change}`);
 
       // Set agent profile status to 'ringing' in database so they aren't assigned another call
-      await executeTenantQuery(tenantId, 
+      await executeTenantQuery(tenantId,
         `UPDATE agent_profiles SET current_status = 'offline', last_status_change = NOW() WHERE user_id = $1`,
         [agent.id]
       );
+      syncAgentQueueMembership(agent.id, 'offline').catch(() => {});
       
       // Update call record to bind this agent
       await executeTenantQuery(tenantId,
@@ -131,6 +133,7 @@ class RoutingService {
           `UPDATE agent_profiles SET current_status = 'offline', last_status_change = NOW() WHERE user_id = $1`,
           [agentId]
         );
+        syncAgentQueueMembership(agentId, 'offline').catch(() => {});
         await executeTenantQuery(session.tenantId,
           `UPDATE calls SET status = 'active', answer_time = NOW() WHERE id = $1`,
           [session.callId]
@@ -168,6 +171,7 @@ class RoutingService {
       `UPDATE agent_profiles SET current_status = 'idle', last_status_change = NOW() WHERE user_id = $1`,
       [agentId]
     );
+    syncAgentQueueMembership(agentId, 'idle').catch(() => {});
 
     // Cancel Asterisk originate channel
     await asteriskService.hangupChannel(`PJSIP/${agentId}`);
