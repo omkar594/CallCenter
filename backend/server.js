@@ -318,6 +318,30 @@ async function initSchema() {
           max_contacts INTEGER DEFAULT 1,
           remove_existing VARCHAR(5) DEFAULT 'yes'
       );
+
+      -- Confirmed live: an AOR being realtime-backed isn't enough on its own - the dynamic
+      -- Contact each REGISTER creates also needs somewhere realtime-backed to live, or
+      -- res_pjsip_registrar.c fails with "Unable to bind contact ... to AOR" even though
+      -- authentication succeeded. Column list is the exact set Asterisk's own INSERT uses
+      -- (confirmed from the query it logs on a schema mismatch), not a guess.
+      CREATE TABLE IF NOT EXISTS ps_contacts (
+          id VARCHAR(255) PRIMARY KEY,
+          uri VARCHAR(255),
+          expiration_time BIGINT,
+          qualify_frequency INTEGER,
+          outbound_proxy VARCHAR(255),
+          path TEXT,
+          user_agent VARCHAR(255),
+          qualify_timeout VARCHAR(10),
+          reg_server VARCHAR(255),
+          authenticate_qualify VARCHAR(5),
+          via_addr VARCHAR(255),
+          via_port INTEGER,
+          call_id VARCHAR(255),
+          endpoint VARCHAR(255),
+          prune_on_boot VARCHAR(5),
+          qualify_2xx_only VARCHAR(5)
+      );
     `);
     console.log('[Database] ✅ Schema and Indexes automatically verified/created.');
   } catch (err) {
