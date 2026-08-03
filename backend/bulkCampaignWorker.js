@@ -341,17 +341,34 @@ async function acquireSingletonLock() {
   return client;
 }
 
+// Retry wrapper around lock acquisition: a bare `await pool.connect()` failure here (e.g. a
+// transient DB-connection hiccup during boot, which Render/Postgres cold starts are prone to)
+// used to be an unhandled promise rejection that silently killed the worker forever - the HTTP
+// server and AMI connection stayed healthy, /health kept reporting fine, but no lead was ever
+// claimed again for the process's entire lifetime, with nothing surfacing the failure anywhere.
+const LOCK_RETRY_DELAY_MS = 5000;
+
+async function startWorkerWithRetry() {
+  while (true) {
+    try {
+      const lockClient = await acquireSingletonLock();
+      if (!lockClient) {
+        console.warn('[Worker] Another process already holds the campaign dialer lock - not starting a second dialer.');
+        return;
+      }
+      console.log('[Worker] Acquired singleton dialer lock.');
+      await startWorkerLoop();
+      return; // startWorkerLoop() only returns on an unexpected exit, not on normal ticks
+    } catch (err) {
+      console.error(`[Worker] Failed to acquire dialer lock (${err.message || err}) - retrying in ${LOCK_RETRY_DELAY_MS}ms`);
+      await sleep(LOCK_RETRY_DELAY_MS);
+    }
+  }
+}
+
 if (global.isWorkerRunning) {
   console.log('[Worker] Duplicate worker start prevented (already running in this process).');
 } else {
   global.isWorkerRunning = true;
-  (async () => {
-    const lockClient = await acquireSingletonLock();
-    if (!lockClient) {
-      console.warn('[Worker] Another process already holds the campaign dialer lock - not starting a second dialer.');
-      return;
-    }
-    console.log('[Worker] Acquired singleton dialer lock.');
-    startWorkerLoop();
-  })();
+  startWorkerWithRetry();
 }
