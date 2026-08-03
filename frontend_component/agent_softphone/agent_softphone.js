@@ -80,7 +80,15 @@ async function registerSoftphone() {
     sockets: [new JsSIP.WebSocketInterface(wssUrl)],
     uri: `sip:${sipUsername}@${sipHost}`,
     password: sipPassword,
-    register: true
+    register: true,
+    // Confirmed live (Workstream 7): without an ICE server here, RTCPeerConnection only
+    // gathers "host" candidates - the browser's own private/Docker-bridge interface addresses
+    // - and never discovers its actual public IP. Asterisk then sends RTP to that private
+    // address, which is unreachable from the internet, so audio never arrives even though SIP
+    // signaling (which just rides the already-open WSS connection) looks completely fine.
+    pcConfig: {
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    }
   });
 
   ua.on('registered', () => setStatusBanner(true));
