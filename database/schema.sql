@@ -266,7 +266,10 @@ CREATE TABLE ps_endpoints (
     dtls_verify VARCHAR(5) DEFAULT 'no',
     dtls_setup VARCHAR(20) DEFAULT 'actpass',
     dtls_auto_generate_cert VARCHAR(5) DEFAULT 'yes',
-    rtcp_mux VARCHAR(5) DEFAULT 'yes'
+    rtcp_mux VARCHAR(5) DEFAULT 'yes',
+    mailboxes VARCHAR(255) -- unused (no voicemail/MWI here), but res_pjsip's realtime endpoint
+                           -- lookup queries this column unconditionally and hard-errors if it's
+                           -- entirely absent from the table - confirmed live on the EC2 box.
 );
 CREATE TABLE ps_auths (
     id VARCHAR(255) PRIMARY KEY,

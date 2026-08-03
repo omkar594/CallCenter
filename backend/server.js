@@ -303,8 +303,10 @@ async function initSchema() {
           dtls_verify VARCHAR(5) DEFAULT 'no',
           dtls_setup VARCHAR(20) DEFAULT 'actpass',
           dtls_auto_generate_cert VARCHAR(5) DEFAULT 'yes',
-          rtcp_mux VARCHAR(5) DEFAULT 'yes'
+          rtcp_mux VARCHAR(5) DEFAULT 'yes',
+          mailboxes VARCHAR(255)
       );
+      ALTER TABLE ps_endpoints ADD COLUMN IF NOT EXISTS mailboxes VARCHAR(255);
       CREATE TABLE IF NOT EXISTS ps_auths (
           id VARCHAR(255) PRIMARY KEY,
           auth_type VARCHAR(40) DEFAULT 'userpass',
