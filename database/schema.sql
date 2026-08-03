@@ -268,9 +268,14 @@ CREATE TABLE ps_endpoints (
     dtls_setup VARCHAR(20) DEFAULT 'actpass',
     dtls_auto_generate_cert VARCHAR(5) DEFAULT 'yes',
     rtcp_mux VARCHAR(5) DEFAULT 'yes',
-    mailboxes VARCHAR(255) -- unused (no voicemail/MWI here), but res_pjsip's realtime endpoint
+    mailboxes VARCHAR(255), -- unused (no voicemail/MWI here), but res_pjsip's realtime endpoint
                            -- lookup queries this column unconditionally and hard-errors if it's
                            -- entirely absent from the table - confirmed live on the EC2 box.
+    direct_media VARCHAR(5) DEFAULT 'no' -- Confirmed live (Workstream 7): Asterisk's own default
+                           -- is 'yes', which stalls media negotiation between a WebRTC (DTLS-SRTP)
+                           -- agent leg and a plain-RTP PSTN leg - call shows "Up" but zero RTP
+                           -- packets ever flow. Must be explicit 'no', matching DinstarTrunk's
+                           -- static config in pjsip.conf.
 );
 CREATE TABLE ps_auths (
     id VARCHAR(255) PRIMARY KEY,

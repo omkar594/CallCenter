@@ -304,9 +304,15 @@ async function initSchema() {
           dtls_setup VARCHAR(20) DEFAULT 'actpass',
           dtls_auto_generate_cert VARCHAR(5) DEFAULT 'yes',
           rtcp_mux VARCHAR(5) DEFAULT 'yes',
-          mailboxes VARCHAR(255)
+          mailboxes VARCHAR(255),
+          direct_media VARCHAR(5) DEFAULT 'no'
       );
       ALTER TABLE ps_endpoints ADD COLUMN IF NOT EXISTS mailboxes VARCHAR(255);
+      -- Confirmed live (Workstream 7): must be explicit 'no', not Asterisk's own 'yes' default -
+      -- direct_media between a WebRTC (DTLS-SRTP) agent leg and a plain-RTP PSTN leg silently
+      -- stalls media negotiation (call shows "Up" but zero RTP packets flow either direction).
+      ALTER TABLE ps_endpoints ADD COLUMN IF NOT EXISTS direct_media VARCHAR(5) DEFAULT 'no';
+      UPDATE ps_endpoints SET direct_media = 'no' WHERE direct_media IS NULL;
       CREATE TABLE IF NOT EXISTS ps_auths (
           id VARCHAR(255) PRIMARY KEY,
           auth_type VARCHAR(40) DEFAULT 'userpass',
