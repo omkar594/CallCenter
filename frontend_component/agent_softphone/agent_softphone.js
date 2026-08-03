@@ -41,7 +41,13 @@ async function login() {
     }
     jwtToken = data.token;
     showPanel(true);
-    await primeMicPermission();
+    // Deliberately NOT awaited: getUserMedia()'s browser permission prompt doesn't resolve
+    // until the agent clicks Allow/Block, which can take an arbitrary amount of time (or
+    // never happen at all, e.g. if they ignore it). SIP registration must not be blocked
+    // waiting on that - an agent who's slow to click the mic prompt should still register and
+    // be able to receive a call; they'll get another mic prompt as part of answering it if
+    // this one hasn't resolved yet.
+    primeMicPermission();
     await registerSoftphone();
   } catch (err) {
     $('login-error').textContent = 'Login request failed: ' + err.message;
